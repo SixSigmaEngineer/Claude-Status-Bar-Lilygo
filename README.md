@@ -18,6 +18,10 @@ A tiny desk display that shows what Claude is doing, live: current model, the to
 
 ![Usage limits page](docs/images/LilyGo2.png)
 
+Mounts wherever you like - desk stand or perched on top of your monitor. One USB-C cable to your PC is both power and data:
+
+![Mounted on a laptop screen](docs/images/Lilygo3.png)
+
 ## Hardware
 
 | Part | Notes |
@@ -63,6 +67,10 @@ Per-session state machine: `run` (Clauding…) → `tool` (shows tool name) → 
 2. **Test:** `bridge\run_bridge.bat --demo` — fake data, verifies the whole pipeline.
 
 3. **Run the app:** `bridge\run_app.bat` — a small desktop app that runs the bridge with a **live preview of the display**, a **logo uploader** (pick any JPG/PNG; it's converted to 48×48, streamed to the device, and saved in its flash — try the 15 ready-made icons in `logos\starter-pack`), **minimize-to-system-tray**, and a **Start with Windows** checkbox. Prefer headless? `run_bridge.bat` runs the bare console bridge and `install_autostart.bat` sets it to start hidden at login; `set_logo.bat` uploads a logo from the command line.
+
+## Customize the badge
+
+The image in the top-left corner of the screen is yours to change: open the app → **Set logo…** → pick any JPG/PNG (your company logo, avatar, pet, whatever). It's converted to 48×48, sent to the display, and saved in the device's flash so it survives reboots. A starter pack of 15 ready-made icons ships in `logos/starter-pack` — sparkles, terminal, robot, space invader, coffee, and friends. `Clear logo` in the app removes it.
 
 ## Controls
 
