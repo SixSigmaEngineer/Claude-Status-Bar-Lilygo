@@ -14,8 +14,6 @@
 
 A tiny desk display that shows what Claude is doing, live: current model, the tool it's running ("Bash", "Read", "Percolating…"), elapsed time, tokens in/out, context usage, and your 5-hour / 7-day rate-limit bars. Works with **Claude Desktop (Cowork)** and **Claude Code**, up to 4 sessions at once.
 
-Inspired by [this r/ClaudeAI post](https://www.reddit.com/r/ClaudeAI/comments/1ui85ys/) — built from scratch with Claude itself doing the driving.
-
 ![Live session status](docs/images/LilyGo1.png)
 
 ![Usage limits page](docs/images/LilyGo2.png)
