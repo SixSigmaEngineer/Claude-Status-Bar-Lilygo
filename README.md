@@ -20,7 +20,7 @@ A tiny desk display that shows what Claude is doing, live: current model, the to
 
 Mounts wherever you like - desk stand or perched on top of your monitor. One USB-C cable to your PC is both power and data:
 
-![Mounted on a laptop screen](docs/images/Lilygo3.png)
+![Mounted on a laptop screen](docs/images/LilyGo3.png)
 
 ## Hardware
 
