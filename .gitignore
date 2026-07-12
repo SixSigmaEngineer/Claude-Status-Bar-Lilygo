@@ -1,0 +1,21 @@
+# build artifacts (toolchain lives in C:\ClaudeBarBuild, but just in case)
+firmware/build/
+firmware/claude_statusbar/AXS15231B.cpp
+firmware/claude_statusbar/AXS15231B.h
+firmware/claude_statusbar/pins_config.h
+*.bin
+*.elf
+*.map
+
+# bridge local state
+bridge/config.json
+bridge/logo.bin
+__pycache__/
+*.pyc
+
+# installer: company-branded, not part of the public repo
+installer/
+
+# company logos stay private; the original starter-pack ships with the repo
+logos/*
+!logos/starter-pack
