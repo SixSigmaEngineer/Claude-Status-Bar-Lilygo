@@ -14,6 +14,8 @@ Requires: pip install pyserial pillow pystray
 
 import json
 import os
+import platform
+import subprocess
 import sys
 import threading
 import time
@@ -148,7 +150,10 @@ class App:
         opts = tk.Frame(self.root, bg="#111318")
         opts.pack(fill="x", padx=14, pady=(0, 8))
         self.autostart_var = tk.BooleanVar(value=self.autostart_installed())
-        tk.Checkbutton(opts, text="Start with Windows (in tray)",
+        login_label = {"Windows": "Start with Windows (in tray)",
+                       "Darwin": "Start at login (in tray)"}.get(
+            platform.system(), "Start at login (in tray)")
+        tk.Checkbutton(opts, text=login_label,
                        variable=self.autostart_var, command=self.set_autostart,
                        bg="#111318", fg="#aaa", selectcolor="#22262e",
                        activebackground="#111318",
@@ -217,33 +222,74 @@ class App:
 
     # ---------------- autostart ----------------
 
+    def _launch_cmd(self):
+        """[interpreter, script?, --tray] used to relaunch the app at login."""
+        if getattr(sys, "frozen", False):   # packaged exe
+            return [sys.executable, "--tray"]
+        py = sys.executable
+        if platform.system() == "Windows":
+            py = py.replace("python.exe", "pythonw.exe")
+        return [py, os.path.join(HERE, "claude_bar_app.py"), "--tray"]
+
     def shortcut_path(self):
-        return os.path.join(os.environ["APPDATA"],
-                            r"Microsoft\Windows\Start Menu\Programs\Startup",
-                            "ClaudeStatusBar.lnk")
+        sysname = platform.system()
+        if sysname == "Windows":
+            return os.path.join(os.environ["APPDATA"],
+                                r"Microsoft\Windows\Start Menu\Programs\Startup",
+                                "ClaudeStatusBar.lnk")
+        if sysname == "Darwin":
+            return os.path.expanduser(
+                "~/Library/LaunchAgents/com.claudestatusbar.app.plist")
+        xdg = os.environ.get("XDG_CONFIG_HOME",
+                             os.path.expanduser("~/.config"))
+        return os.path.join(xdg, "autostart", "claudestatusbar.desktop")
 
     def autostart_installed(self):
         return os.path.exists(self.shortcut_path())
 
     def set_autostart(self):
         try:
-            if self.autostart_var.get():
-                if getattr(sys, "frozen", False):   # packaged exe
-                    target, args, wdir = sys.executable, "--tray", \
-                        os.path.dirname(sys.executable)
-                else:
-                    target = sys.executable.replace("python.exe", "pythonw.exe")
-                    args = f'\"{os.path.join(HERE, "claude_bar_app.py")}\" --tray'
-                    wdir = HERE
-                ps = (f"$ws = New-Object -ComObject WScript.Shell; "
-                      f"$s = $ws.CreateShortcut('{self.shortcut_path()}'); "
+            path = self.shortcut_path()
+            if not self.autostart_var.get():
+                if os.path.exists(path):
+                    if platform.system() == "Darwin":
+                        subprocess.run(["launchctl", "unload", path],
+                                       capture_output=True)
+                    os.remove(path)
+                return
+            cmd = self._launch_cmd()
+            sysname = platform.system()
+            if sysname == "Windows":
+                target, rest = cmd[0], subprocess.list2cmdline(cmd[1:])
+                ps = ("$ws = New-Object -ComObject WScript.Shell; "
+                      f"$s = $ws.CreateShortcut('{path}'); "
                       f"$s.TargetPath = '{target}'; "
-                      f"$s.Arguments = '{args}'; "
-                      f"$s.WorkingDirectory = '{wdir}'; $s.Save()")
-                os.system(f'powershell -NoProfile -Command "{ps}"')
+                      f"$s.Arguments = '{rest}'; "
+                      f"$s.WorkingDirectory = '{HERE}'; $s.Save()")
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True)
+            elif sysname == "Darwin":
+                import plistlib
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    plistlib.dump({
+                        "Label": "com.claudestatusbar.app",
+                        "ProgramArguments": cmd,
+                        "WorkingDirectory": HERE,
+                        "RunAtLoad": True,
+                    }, f)
+                subprocess.run(["launchctl", "load", path],
+                               capture_output=True)
             else:
-                if os.path.exists(self.shortcut_path()):
-                    os.remove(self.shortcut_path())
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                exec_line = " ".join(
+                    f'"{c}"' if " " in c else c for c in cmd)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("[Desktop Entry]\nType=Application\n"
+                            "Name=Claude Status Bar\n"
+                            f"Exec={exec_line}\n"
+                            f"Path={HERE}\n"
+                            "X-GNOME-Autostart-enabled=true\n")
         except Exception as e:
             messagebox.showerror("Autostart", str(e))
 

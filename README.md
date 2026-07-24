@@ -1,8 +1,8 @@
 # Claude Status Bar
 
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Python](https://img.shields.io/badge/Python-3.10--3.13-blue)
-![Platform](https://img.shields.io/badge/Platform-Windows-blue)
+![Python](https://img.shields.io/badge/Python-3.10--3.14-blue)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![ESP32-S3](https://img.shields.io/badge/MCU-ESP32--S3-orange)
 
 ![clauding](https://img.shields.io/badge/clauding-24%2F7-blueviolet)
@@ -47,26 +47,34 @@ firmware/claude_statusbar.ino  (ESP32-S3)
 your eyeballs
 ```
 
-The bridge watches these locations (auto-detected, including the MSIX-virtualized path Claude Desktop actually writes to on Windows):
+The bridge watches these locations (auto-detected per platform; `CLAUDE_CONFIG_DIR` is honored):
 
-- `%USERPROFILE%\.claude\projects\**\*.jsonl` — Claude Code
-- `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\local-agent-mode-sessions\**\.claude\projects\**\*.jsonl` — Claude Desktop / Cowork
+- `~/.claude/projects/**/*.jsonl` — Claude Code (all platforms; `%USERPROFILE%\.claude\...` on Windows)
+- Claude Desktop / Cowork transcripts:
+  - Windows: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\local-agent-mode-sessions\...` (the MSIX-virtualized path the app actually writes to)
+  - macOS: `~/Library/Application Support/Claude/local-agent-mode-sessions/...`
+  - Linux: `~/.config/Claude/local-agent-mode-sessions/...`
 
 Per-session state machine: `run` (Clauding…) → `tool` (shows tool name) → `wait` (orange "Waiting on you" — pending permission or Claude asked a question) → `done` / `idle`. Sessions auto-follow the most recently active one, but jump to any session that's waiting on you, with an orange alert banner.
 
 ## Setup
 
-**Prereq:** Python 3.10+ ([python.org](https://python.org), check "Add to PATH").
+Works on **Windows, macOS, and Linux**. New board? It ships with LilyGo's factory demo (a "smart config / ESPTouch / xinyuandianzi" WiFi screen) — ignore it; step 1 flashes right over it.
 
-1. **Flash the firmware** — plug the display in via USB-C, then run in PowerShell from `firmware\`:
-   ```
-   powershell -ExecutionPolicy Bypass -File .\build_and_flash.ps1
-   ```
-   Fully self-contained: downloads arduino-cli, the ESP32 toolchain (~1.5 GB, first run only), LilyGo's official display driver, and all libraries into `C:\ClaudeBarBuild`, then compiles and flashes. If the wrong COM port is picked, add `-Port COM5`. If upload fails: hold **BOOT** while plugging in USB, release, retry.
+**Prereq:** Python 3.10+ ([python.org](https://python.org); on Windows check "Add to PATH").
 
-2. **Test:** `bridge\run_bridge.bat --demo` — fake data, verifies the whole pipeline.
+1. **Flash the firmware** — plug the display in via USB-C, then from `firmware/`:
 
-3. **Run the app:** `bridge\run_app.bat` — a small desktop app that runs the bridge with a **live preview of the display**, a **logo uploader** (pick any JPG/PNG; it's converted to 48×48, streamed to the device, and saved in its flash — try the 15 ready-made icons in `logos\starter-pack`), **minimize-to-system-tray**, and a **Start with Windows** checkbox. Prefer headless? `run_bridge.bat` runs the bare console bridge and `install_autostart.bat` sets it to start hidden at login; `set_logo.bat` uploads a logo from the command line.
+   - **Windows** (PowerShell): `powershell -ExecutionPolicy Bypass -File .\build_and_flash.ps1` (add `-Port COM5` if the wrong port is picked)
+   - **macOS / Linux**: `./build_and_flash.sh` (add `--port /dev/ttyACM0` to override)
+
+   Fully self-contained: downloads arduino-cli, the ESP32 toolchain (~1.5 GB, first run only), LilyGo's official display driver, and all libraries into `C:\ClaudeBarBuild` / `~/ClaudeBarBuild`, then compiles and flashes. If upload fails: hold **BOOT** while plugging in USB, release, retry.
+
+   **Linux one-time setup:** `sudo usermod -aG dialout $USER` (then log out/in). If the serial port vanishes when you plug in, remove the port-grabbing screen-reader daemon: `sudo apt remove brltty`.
+
+2. **Test:** `bridge\run_bridge.bat --demo` (Windows) / `bridge/run_bridge.sh --demo` (Mac/Linux) — fake data, verifies the whole pipeline.
+
+3. **Run the app:** `bridge\run_app.bat` / `bridge/run_app.sh` — a small desktop app that runs the bridge with a **live preview of the display**, a **logo uploader** (pick any JPG/PNG; it's converted to 48×48, streamed to the device, and saved in its flash — try the 15 ready-made icons in `logos/starter-pack`), **minimize-to-system-tray**, and a **start at login** checkbox. Prefer headless? `run_bridge.bat` / `run_bridge.sh` runs the bare console bridge (`install_autostart.bat` on Windows starts it hidden at login) and `set_logo.bat` / `set_logo.sh` uploads a logo from the command line. On Mac/Linux the app needs tkinter: `brew install python-tk` / `sudo apt install python3-tk`.
 
 ## Customize the badge
 
@@ -84,7 +92,7 @@ After a tap the screen needs a couple of seconds before the next tap registers �
 
 ## Usage limits page
 
-If you're logged into Claude Code, the bridge reads your **real** 5-hour/7-day utilization and reset times from Anthropic's usage API (refreshed every 60s). Otherwise it shows a local estimate from transcript token counts — tune `est_cap_5h_tokens` / `est_cap_7d_tokens` in `bridge\config.json` (copy from `config.example.json`).
+If you're logged into Claude Code, the bridge reads your **real** 5-hour/7-day utilization and reset times from Anthropic's usage API (refreshed every 60s). Credentials come from `~/.claude/.credentials.json` (Windows/Linux) or the login Keychain (macOS). Otherwise it shows a local estimate from transcript token counts — tune `est_cap_5h_tokens` / `est_cap_7d_tokens` in `bridge\config.json` (copy from `config.example.json`).
 
 ## Configuration
 
@@ -94,8 +102,10 @@ Copy `bridge\config.example.json` → `bridge\config.json`. Everything is option
 
 | Symptom | Fix |
 |---|---|
-| "Bridge offline" on display | Bridge not running, or wrong port: `run_bridge.bat --port COM5` |
-| "No sessions" | `run_bridge.bat --scan` shows which transcripts were found |
+| "Bridge offline" on display | Bridge not running, or wrong port: `run_bridge --port COM5` (Windows) / `--port /dev/ttyACM0` (Linux) / `--port /dev/cu.usbmodemXXXX` (Mac) |
+| "No sessions" | `run_bridge --scan` shows which transcripts were found |
+| Linux: permission denied on port | `sudo usermod -aG dialout $USER`, log out/in |
+| Linux: port disappears on plug-in | `sudo apt remove brltty` |
 | Blue/orange colors swapped | Set `SWAP_BYTES 0` in the .ino, re-run build script |
 | Display upside down | Hold BOOT ~1s |
 | Flash fails | Hold BOOT while plugging USB, release, retry |
@@ -106,14 +116,15 @@ Copy `bridge\config.example.json` → `bridge\config.json`. Everything is option
 ```
 firmware/
   build_and_flash.ps1        one-click toolchain + build + flash (Windows)
+  build_and_flash.sh         same, for macOS / Linux
   claude_statusbar/          Arduino sketch (driver files auto-copied by script)
 bridge/
   claude_bar_app.py          desktop app: bridge + live preview + tray + logo UI
   claude_bar_bridge.py       core bridge (transcript tailer + serial feeder)
-  set_logo.py / .bat         command-line logo uploader (48x48 RGB565)
-  run_app.bat                launch the desktop app
-  run_bridge.bat             headless console bridge
-  install_autostart.bat      headless autostart at login
+  set_logo.py / .bat / .sh   command-line logo uploader (48x48 RGB565)
+  run_app.bat / .sh          launch the desktop app
+  run_bridge.bat / .sh       headless console bridge
+  install_autostart.bat      headless autostart at login (Windows)
   config.example.json
 docs/
   HOW_IT_WORKS.md            architecture + hardware quirks (worth reading!)

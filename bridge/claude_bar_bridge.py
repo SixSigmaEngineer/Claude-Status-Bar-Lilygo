@@ -20,6 +20,8 @@ import argparse
 import glob
 import json
 import os
+import platform
+import subprocess
 import sys
 import time
 from collections import deque
@@ -27,25 +29,37 @@ from datetime import datetime, timezone
 
 # ---------------------------------------------------------------- config
 
+IS_WINDOWS = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
+
 APPDATA = os.environ.get("APPDATA", os.path.expanduser("~\\AppData\\Roaming"))
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
 HOME = os.path.expanduser("~")
 
+# CLAUDE_CONFIG_DIR relocates the whole ~/.claude tree (all platforms)
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+
 
 def default_roots():
-    roots = [
-        os.path.join(HOME, ".claude", "projects"),
-        os.path.join(APPDATA, "Claude", "local-agent-mode-sessions"),
-    ]
-    # The MSIX-packaged Claude Desktop app virtualizes its AppData writes to
-    # AppData\Local\Packages\Claude_*\LocalCache\Roaming\Claude\...
-    pkg_root = os.path.join(LOCALAPPDATA, "Packages")
-    if os.path.isdir(pkg_root):
-        for name in os.listdir(pkg_root):
-            if "claude" in name.lower():
-                roots.append(os.path.join(
-                    pkg_root, name, "LocalCache", "Roaming", "Claude",
-                    "local-agent-mode-sessions"))
+    roots = [os.path.join(CLAUDE_DIR, "projects")]   # Claude Code, all platforms
+    if IS_WINDOWS:
+        roots.append(os.path.join(APPDATA, "Claude", "local-agent-mode-sessions"))
+        # The MSIX-packaged Claude Desktop app virtualizes its AppData writes to
+        # AppData\Local\Packages\Claude_*\LocalCache\Roaming\Claude\...
+        pkg_root = os.path.join(LOCALAPPDATA, "Packages")
+        if os.path.isdir(pkg_root):
+            for name in os.listdir(pkg_root):
+                if "claude" in name.lower():
+                    roots.append(os.path.join(
+                        pkg_root, name, "LocalCache", "Roaming", "Claude",
+                        "local-agent-mode-sessions"))
+    elif IS_MAC:
+        roots.append(os.path.join(HOME, "Library", "Application Support",
+                                  "Claude", "local-agent-mode-sessions"))
+    else:  # Linux
+        roots.append(os.path.join(
+            os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+            "Claude", "local-agent-mode-sessions"))
     return roots
 
 
@@ -67,9 +81,16 @@ DEFAULT_CONFIG = {
 
 def data_dir():
     """Where config.json / logo.bin live. Next to the scripts normally;
-    %APPDATA%\\ClaudeStatusBar when running as a packaged exe."""
+    a per-user app-data dir when running as a packaged exe."""
     if getattr(sys, "frozen", False):
-        d = os.path.join(APPDATA, "ClaudeStatusBar")
+        if IS_WINDOWS:
+            d = os.path.join(APPDATA, "ClaudeStatusBar")
+        elif IS_MAC:
+            d = os.path.join(HOME, "Library", "Application Support", "ClaudeStatusBar")
+        else:
+            d = os.path.join(
+                os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+                "ClaudeStatusBar")
         os.makedirs(d, exist_ok=True)
         return d
     return os.path.dirname(os.path.abspath(__file__))
@@ -358,14 +379,33 @@ class UsageTracker:
         while self.events and self.events[0][0] < cutoff:
             self.events.popleft()
 
+    @staticmethod
+    def _oauth_token():
+        """Claude Code login token: .credentials.json on Windows/Linux,
+        the login Keychain on macOS. The file is checked first on every
+        platform since macOS uses it as an override in SSH/tmux setups."""
+        cred_path = os.path.join(CLAUDE_DIR, ".credentials.json")
+        blob = None
+        if os.path.exists(cred_path):
+            with open(cred_path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+        elif IS_MAC:
+            out = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=10)
+            if out.returncode == 0 and out.stdout.strip():
+                blob = json.loads(out.stdout.strip())
+        if not blob:
+            raise FileNotFoundError("no Claude Code credentials")
+        return blob["claudeAiOauth"]["accessToken"]
+
     def _try_api(self):
         if time.time() - self.api_checked < 60:
             return self.api_cache
         self.api_checked = time.time()
-        cred_path = os.path.join(HOME, ".claude", ".credentials.json")
         try:
-            with open(cred_path, "r", encoding="utf-8") as f:
-                token = json.load(f)["claudeAiOauth"]["accessToken"]
+            token = self._oauth_token()
             import urllib.request
             req = urllib.request.Request(
                 "https://api.anthropic.com/api/oauth/usage",
@@ -415,10 +455,16 @@ class SerialLink:
 
     def _detect(self):
         from serial.tools import list_ports
-        for p in list_ports.comports():
+        ports = list(list_ports.comports())
+        for p in ports:
             if (p.vid, p.pid) in self.VID_PID:
                 return p.device
-        ports = list(list_ports.comports())
+        # fall back to anything that looks like a USB serial device
+        # (avoids grabbing Bluetooth/debug ports on macOS)
+        usb = [p for p in ports if any(k in p.device for k in
+               ("usbmodem", "usbserial", "ttyACM", "ttyUSB", "COM"))]
+        if len(usb) == 1:
+            return usb[0].device
         return ports[0].device if len(ports) == 1 else None
 
     def send(self, text):
