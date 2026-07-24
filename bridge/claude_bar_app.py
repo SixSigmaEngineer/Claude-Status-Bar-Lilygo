@@ -14,6 +14,8 @@ Requires: pip install pyserial pillow pystray
 
 import json
 import os
+import platform
+import subprocess
 import sys
 import threading
 import time
@@ -102,6 +104,8 @@ class BridgeThread(threading.Thread):
             self.connected = self.link.ser is not None
             if self.link.ser is not None and (self.link.ser is not self._last_ser
                                               or self.logo_dirty):
+                if self.link.ser is not self._last_ser:
+                    self.link.send(bridge.input_cfg_packet(self.cfg))
                 self._last_ser = self.link.ser
                 self.logo_dirty = False
                 self._send_logo()
@@ -148,7 +152,10 @@ class App:
         opts = tk.Frame(self.root, bg="#111318")
         opts.pack(fill="x", padx=14, pady=(0, 8))
         self.autostart_var = tk.BooleanVar(value=self.autostart_installed())
-        tk.Checkbutton(opts, text="Start with Windows (in tray)",
+        login_label = {"Windows": "Start with Windows (in tray)",
+                       "Darwin": "Start at login (in tray)"}.get(
+            platform.system(), "Start at login (in tray)")
+        tk.Checkbutton(opts, text=login_label,
                        variable=self.autostart_var, command=self.set_autostart,
                        bg="#111318", fg="#aaa", selectcolor="#22262e",
                        activebackground="#111318",
@@ -217,33 +224,74 @@ class App:
 
     # ---------------- autostart ----------------
 
+    def _launch_cmd(self):
+        """[interpreter, script?, --tray] used to relaunch the app at login."""
+        if getattr(sys, "frozen", False):   # packaged exe
+            return [sys.executable, "--tray"]
+        py = sys.executable
+        if platform.system() == "Windows":
+            py = py.replace("python.exe", "pythonw.exe")
+        return [py, os.path.join(HERE, "claude_bar_app.py"), "--tray"]
+
     def shortcut_path(self):
-        return os.path.join(os.environ["APPDATA"],
-                            r"Microsoft\Windows\Start Menu\Programs\Startup",
-                            "ClaudeStatusBar.lnk")
+        sysname = platform.system()
+        if sysname == "Windows":
+            return os.path.join(os.environ["APPDATA"],
+                                r"Microsoft\Windows\Start Menu\Programs\Startup",
+                                "ClaudeStatusBar.lnk")
+        if sysname == "Darwin":
+            return os.path.expanduser(
+                "~/Library/LaunchAgents/com.claudestatusbar.app.plist")
+        xdg = os.environ.get("XDG_CONFIG_HOME",
+                             os.path.expanduser("~/.config"))
+        return os.path.join(xdg, "autostart", "claudestatusbar.desktop")
 
     def autostart_installed(self):
         return os.path.exists(self.shortcut_path())
 
     def set_autostart(self):
         try:
-            if self.autostart_var.get():
-                if getattr(sys, "frozen", False):   # packaged exe
-                    target, args, wdir = sys.executable, "--tray", \
-                        os.path.dirname(sys.executable)
-                else:
-                    target = sys.executable.replace("python.exe", "pythonw.exe")
-                    args = f'\"{os.path.join(HERE, "claude_bar_app.py")}\" --tray'
-                    wdir = HERE
-                ps = (f"$ws = New-Object -ComObject WScript.Shell; "
-                      f"$s = $ws.CreateShortcut('{self.shortcut_path()}'); "
+            path = self.shortcut_path()
+            if not self.autostart_var.get():
+                if os.path.exists(path):
+                    if platform.system() == "Darwin":
+                        subprocess.run(["launchctl", "unload", path],
+                                       capture_output=True)
+                    os.remove(path)
+                return
+            cmd = self._launch_cmd()
+            sysname = platform.system()
+            if sysname == "Windows":
+                target, rest = cmd[0], subprocess.list2cmdline(cmd[1:])
+                ps = ("$ws = New-Object -ComObject WScript.Shell; "
+                      f"$s = $ws.CreateShortcut('{path}'); "
                       f"$s.TargetPath = '{target}'; "
-                      f"$s.Arguments = '{args}'; "
-                      f"$s.WorkingDirectory = '{wdir}'; $s.Save()")
-                os.system(f'powershell -NoProfile -Command "{ps}"')
+                      f"$s.Arguments = '{rest}'; "
+                      f"$s.WorkingDirectory = '{HERE}'; $s.Save()")
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True)
+            elif sysname == "Darwin":
+                import plistlib
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    plistlib.dump({
+                        "Label": "com.claudestatusbar.app",
+                        "ProgramArguments": cmd,
+                        "WorkingDirectory": HERE,
+                        "RunAtLoad": True,
+                    }, f)
+                subprocess.run(["launchctl", "load", path],
+                               capture_output=True)
             else:
-                if os.path.exists(self.shortcut_path()):
-                    os.remove(self.shortcut_path())
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                exec_line = " ".join(
+                    f'"{c}"' if " " in c else c for c in cmd)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("[Desktop Entry]\nType=Application\n"
+                            "Name=Claude Status Bar\n"
+                            f"Exec={exec_line}\n"
+                            f"Path={HERE}\n"
+                            "X-GNOME-Autostart-enabled=true\n")
         except Exception as e:
             messagebox.showerror("Autostart", str(e))
 
@@ -353,37 +401,42 @@ class App:
                       font=("Segoe UI", 20, "bold"), anchor="w")
         c.create_line(178, 18, 178, 166, fill=PANEL)
 
-        # center: model above state
-        mid = 190 + (self.W - 10 - 190) / 2
+        # center: project / title / state / detail
+        z0 = 196
+        pj = s.get("pj") or s.get("nm") or "Claude"
+        c.create_text(z0, 32, text=pj, fill=TEXT, anchor="w",
+                      font=("Segoe UI", 15, "bold"))
         mline = s.get("md", "Claude")
         if s.get("ef"):
-            mline += f"  ·  {s['ef']}"
-        c.create_text(mid, 32, text=mline, fill=DIM, font=("Segoe UI", 11))
+            mline += f" · {s['ef']}"
+        c.create_text(self.W - 10, 32, text=mline, fill=DIM, anchor="e",
+                      font=("Segoe UI", 10))
+        if s.get("pj") and s.get("nm"):
+            c.create_text(z0, 58, text=s["nm"], fill=DIM, anchor="w",
+                          font=("Segoe UI", 10))
 
         st = s.get("st", "idle")
-        run_words = ["Clauding...", "Thinking...", "Percolating...",
-                     "Reflecting...", "Considering...", "Analyzing...",
-                     "Reasoning...", "Reviewing...", "Drafting...",
-                     "Refining...", "Pondering...", "Ruminating...",
-                     "Cogitating...", "Synthesizing...", "Noodling...",
-                     "Brewing..."]
-        import random
-        now = time.time()
-        if st == "run":
-            if not hasattr(self, "_rw_at") or now - self._rw_at > 7:
-                self._rw = random.choice(run_words)
-                self._rw_at = now
-        else:
-            self._rw_at = 0
         word, col = {
             "tool": (s.get("tl") or "Tool", TEXT),
-            "run": (getattr(self, "_rw", "Clauding..."), TEXT),
+            "run": ("Running", TEXT),
             "wait": ("Waiting on you", ORANGE),
             "done": ("Done", GREEN),
         }.get(st, ("Idle", DIM))
         prefix = "✦ " if st in ("run", "tool") else ""
-        c.create_text(mid, 88, text=prefix + word, fill=col,
-                      font=("Segoe UI", 26, "bold"))
+        c.create_text(z0 + 8, 100, text=prefix + word, fill=col, anchor="w",
+                      font=("Segoe UI", 24, "bold"))
+
+        dline = ""
+        if st == "wait" and s.get("tl") and s.get("tl") != "Question":
+            dline = f"approve: {s['tl']}" + (f" · {s['td']}" if s.get("td") else "")
+        elif s.get("td"):
+            dline = s["td"]
+        if s.get("sa"):
+            dline += ("· " if not dline else " · ") + \
+                     f"{s['sa']} subagent{'s' if s['sa'] > 1 else ''}"
+        if dline:
+            c.create_text(z0 + 10, 130, text=dline, fill=DIM, anchor="w",
+                          font=("Segoe UI", 10))
 
         def fmt_k(v):
             v = v or 0
@@ -395,8 +448,8 @@ class App:
 
         el = s.get("el", 0)
         eb = f"{el}s" if el < 180 else f"{el // 60}m{el % 60:02d}s"
-        c.create_text(mid, 158, text=f"{eb}   ▲{fmt_k(s.get('ti'))}   ▼{fmt_k(s.get('to'))}",
-                      fill=DIM, font=("Segoe UI", 11))
+        c.create_text(z0, 158, text=f"{eb}   ▲{fmt_k(s.get('ti'))}   ▼{fmt_k(s.get('to'))}",
+                      fill=DIM, anchor="w", font=("Segoe UI", 11))
 
     def draw_usage(self, pkt):
         c = self.canvas

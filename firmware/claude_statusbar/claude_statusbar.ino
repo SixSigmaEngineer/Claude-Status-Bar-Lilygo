@@ -5,12 +5,14 @@
  * context %) plus a usage-limits page. Fed by claude_bar_bridge.py on the PC
  * over USB serial @ 115200 as newline-delimited JSON.
  *
- * Controls:
- *   - Tap screen            : switch page (status <-> usage)
- *   - Double-tap screen     : cycle active session
- *   - Long-press (>1s)      : flip display 180° (saved to flash)
- *   - BOOT button short     : switch page
- *   - BOOT button long      : cycle session
+ * Controls - all remappable via bridge/config.json "input" (defaults):
+ *   - Tap screen            : cycle active session
+ *   - Swipe left/right      : cycle active session
+ *   - Touch-hold (0.6s)     : usage page (toggle)
+ *   - BOOT button short     : cycle active session
+ *   - BOOT button long (1s) : flip display 180° (saved to flash)
+ * Actions: cycle | page | usage | flip | none. Boards without a working
+ * touch chip fall back to blind-tap = the "tap" action.
  *
  * Build notes: requires AXS15231B.cpp/.h + pins_config.h from the official
  * LilyGo T-Display-S3-Long repo copied into this sketch folder (the
@@ -29,6 +31,7 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include "AXS15231B.h"
 #include "pins_config.h"
+#include "touch_drv.h"
 
 /* ---------- fallbacks in case pins_config.h names differ ---------- */
 #ifndef TOUCH_IICSCL
@@ -72,18 +75,23 @@
 
 /* ---------- state ---------- */
 struct Sess {
-  char nm[26];  // session name
+  char pj[22];  // project (cwd basename)
+  char nm[58];  // session title (custom > ai-title > summary)
   char md[22];  // model, e.g. "Fable 5"
   char st[10];  // run | tool | wait | idle | done
   char tl[22];  // tool name
+  char td[34];  // tool detail ("npm test", "auth.ts", question text)
   char ef[12];  // effort
+  char tk[10];  // context tokens, human ("612k")
+  int  sa;      // active subagents
   long el;      // elapsed seconds (at packet time)
   long ti, to;  // tokens in / out
   int  cx;      // context %
   bool at;      // needs attention
 };
 
-Sess ses[4];
+#define MAX_SES 8
+Sess ses[MAX_SES];
 int  nSes = 0, act = 0;
 
 struct { int p5 = -1, p7 = -1; char r5[14] = ""; char r7[14] = ""; bool est = true; } usage;
@@ -110,11 +118,29 @@ uint8_t  spinPhase = 0;
 volatile bool touchIRQ = false;
 volatile uint32_t irqCount = 0;
 void IRAM_ATTR touchISR() { touchIRQ = true; irqCount++; }
-uint32_t tDownAt = 0, tUpAt = 0;
-bool     touching = false, longFired = false;
-int      pendingTaps = 0;
+TouchBackend touchBE = TOUCH_NONE;
+bool     touching = false, holdFired = false;
+int16_t  tX0 = 0, tY0 = 0, tXl = 0, tYl = 0;
+uint32_t tDownAt = 0;
 uint32_t btnDownAt = 0;
 bool     btnWas = false;
+
+/* input bindings (overridable from bridge/config.json via the "cf" packet) */
+enum InputAction : uint8_t { ACT_NONE, ACT_PAGE, ACT_CYCLE, ACT_FLIP };
+uint8_t actTap      = ACT_CYCLE;
+uint8_t actSwipe    = ACT_CYCLE;
+uint8_t actHold     = ACT_PAGE;   // "usage" maps here (toggle status/usage)
+uint8_t actBtnShort = ACT_CYCLE;
+uint8_t actBtnLong  = ACT_FLIP;
+
+static uint8_t parseAction(const char *s) {
+  if (!s)                    return ACT_NONE;
+  if (!strcmp(s, "cycle"))   return ACT_CYCLE;
+  if (!strcmp(s, "page"))    return ACT_PAGE;
+  if (!strcmp(s, "usage"))   return ACT_PAGE;
+  if (!strcmp(s, "flip"))    return ACT_FLIP;
+  return ACT_NONE;
+}
 
 static char lineBuf[4096];
 static size_t lineLen = 0;
@@ -147,6 +173,27 @@ static void drawCentered(const char *s, int cx0, int cx1, int baseY, uint16_t co
   cv->setTextColor(color);
   cv->setCursor(x, baseY);
   cv->print(s);
+}
+
+/* print, truncating with an ellipsis only when the text actually exceeds
+ * maxX (pixel-measured, not a blind character cutoff) */
+static void printTruncated(const char *s, int x, int baseY, int maxX,
+                           uint16_t color) {
+  char buf[64];
+  strlcpy(buf, s, sizeof(buf));
+  cv->setTextColor(color);
+  cv->setCursor(x, baseY);
+  if (x + textW(buf) <= maxX) {
+    cv->print(buf);
+    return;
+  }
+  int len = strlen(buf);
+  int dots = textW("...");
+  while (len > 1 && x + textW(buf) + dots > maxX) {
+    buf[--len] = 0;
+  }
+  cv->print(buf);
+  cv->print("...");
 }
 
 static uint16_t ctxColor(int pct) {
@@ -287,61 +334,62 @@ static void drawStatusPage() {
   cv->setCursor(10, 158);
   cv->print(pct);
 
-  cv->drawFastVLine(178, 18, 148, C_PANEL);
-
-  /* ----- center: model name above the state word ----- */
-  {
-    char mline[40];
-    if (s.ef[0]) snprintf(mline, sizeof(mline), "%s  ·  %s", s.md, s.ef);
-    else         strlcpy(mline, s.md, sizeof(mline));
-    cv->setFont(&FreeSans9pt7b);
-    drawCentered(mline, 190, CANVAS_W - 10, 36, C_DIM);
+  // raw context tokens under the % (so the % has a visible denominator story)
+  if (s.tk[0]) {
+    cv->setFont(NULL); cv->setTextSize(1);
+    cv->setTextColor(C_DIM);
+    cv->setCursor(10, 168);
+    cv->print(s.tk);
   }
 
-  // rotating whimsical thinking-words, in the spirit of Claude's own
-  static const char *RUN_WORDS[] = {
-    "Clauding...",     "Thinking...",     "Percolating...",
-    "Reflecting...",   "Considering...",  "Analyzing...",
-    "Reasoning...",    "Reviewing...",    "Drafting...",
-    "Refining...",     "Pondering...",    "Ruminating...",
-    "Cogitating...",   "Synthesizing...", "Noodling...",
-    "Brewing...",
-  };
-  static const int N_RUN_WORDS = sizeof(RUN_WORDS) / sizeof(RUN_WORDS[0]);
-  static int runWord = 0;
-  static uint32_t runWordAt = 0;
-  static bool wasRunning = false;
+  cv->drawFastVLine(178, 18, 148, C_PANEL);
 
+  int zone0 = 196, zone1 = CANVAS_W - 10;
+
+  /* ----- row 1: PROJECT (the thing that ties display to session) ----- */
+  {
+    // model · effort, right-aligned; project truncates against it
+    char mline[36];
+    if (s.ef[0]) snprintf(mline, sizeof(mline), "%s · %s", s.md, s.ef);
+    else         strlcpy(mline, s.md, sizeof(mline));
+    cv->setFont(&FreeSans9pt7b);
+    int16_t mw = textW(mline);
+    cv->setTextColor(C_DIM);
+    cv->setCursor(zone1 - mw, 38);
+    cv->print(mline);
+
+    const char *pj = s.pj[0] ? s.pj : (s.nm[0] ? s.nm : "Claude");
+    cv->setFont(&FreeSansBold12pt7b);
+    printTruncated(pj, zone0, 40, zone1 - mw - 14, C_TEXT);
+  }
+
+  /* ----- row 2: session title (custom rename > ai-title) ----- */
+  if (s.pj[0] && s.nm[0]) {
+    cv->setFont(&FreeSans9pt7b);
+    printTruncated(s.nm, zone0, 64, zone1, C_DIM);
+  }
+
+  /* ----- row 3: state word (real state, no clodisms) ----- */
   const char *word;
   uint16_t wcol = C_TEXT;
   bool animate = false;
-  bool running = !strcmp(s.st, "run");
-  if (running && (!wasRunning || millis() - runWordAt > 7000)) {
-    runWord = esp_random() % N_RUN_WORDS;
-    runWordAt = millis();
-  }
-  wasRunning = running;
-
   if      (!strcmp(s.st, "tool")) { word = s.tl[0] ? s.tl : "Tool"; animate = true; }
-  else if (running)               { word = RUN_WORDS[runWord]; animate = true; }
+  else if (!strcmp(s.st, "run"))  { word = "Running"; animate = true; }
   else if (!strcmp(s.st, "wait")) { word = "Waiting on you"; wcol = C_ORANGE; }
   else if (!strcmp(s.st, "done")) { word = "Done"; wcol = C_GREEN; }
   else                            { word = "Idle"; wcol = C_DIM; }
 
   cv->setFont(&FreeSansBold24pt7b);
   int16_t w = textW(word);
-  int zone0 = 190, zone1 = CANVAS_W - 10;
   if (w > (zone1 - zone0) - 70) {          // too wide: drop to a smaller font
     cv->setFont(&FreeSansBold18pt7b);
     w = textW(word);
   }
-  int tx = zone0 + ((zone1 - zone0) - w) / 2 + 14;
-  if (tx < zone0 + 30) tx = zone0 + 30;
-  int baseY = 100;
+  int tx = zone0 + 34;
+  int baseY = 110;
   if (animate) {
     drawSpinner(tx - 26, baseY - 13, C_ORANGE);
   } else if (!strcmp(s.st, "wait")) {
-    // hollow circle marker
     cv->drawCircle(tx - 26, baseY - 13, 9, C_ORANGE);
     cv->drawCircle(tx - 26, baseY - 13, 8, C_ORANGE);
   }
@@ -349,7 +397,27 @@ static void drawStatusPage() {
   cv->setCursor(tx, baseY);
   cv->print(word);
 
-  /* ----- bottom metrics line ----- */
+  /* ----- row 4: detail - what it's doing / waiting for, + subagents ----- */
+  {
+    char dline[64] = "";
+    if (!strcmp(s.st, "wait") && s.tl[0] && strcmp(s.tl, "Question"))
+      snprintf(dline, sizeof(dline), "approve: %s%s%s", s.tl,
+               s.td[0] ? " · " : "", s.td);
+    else if (s.td[0])
+      strlcpy(dline, s.td, sizeof(dline));
+    if (s.sa > 0) {
+      char sab[20];
+      snprintf(sab, sizeof(sab), "%s%d subagent%s", dline[0] ? " · " : "",
+               s.sa, s.sa > 1 ? "s" : "");
+      strlcat(dline, sab, sizeof(dline));
+    }
+    if (dline[0]) {
+      cv->setFont(&FreeSans9pt7b);
+      printTruncated(dline, zone0 + 8, 137, zone1, C_DIM);
+    }
+  }
+
+  /* ----- row 5: elapsed + tokens ----- */
   long elShown = s.el;
   if (animate) elShown += (long)((millis() - lastPacket) / 1000);
   char eb[12], tib[12], tob[12];
@@ -359,26 +427,14 @@ static void drawStatusPage() {
 
   cv->setFont(&FreeSans9pt7b);
   cv->setTextColor(C_DIM);
-  // measure segments to center the whole group
-  char seg1[16], seg2[16], seg3[16];
-  snprintf(seg1, sizeof(seg1), "%s", eb);
-  snprintf(seg2, sizeof(seg2), "%s", tib);
-  snprintf(seg3, sizeof(seg3), "%s", tob);
-  int wSeg1 = textW(seg1), wSeg2 = textW(seg2), wSeg3 = textW(seg3);
   int gap = 22, icon = 12;
-  int total = wSeg1 + gap + icon + wSeg2 + gap + icon + wSeg3;
-  int x = zone0 + ((zone1 - zone0) - total) / 2;
+  int x = zone0;
   int yBase = 166;
-
-  cv->setCursor(x, yBase); cv->print(seg1); x += wSeg1 + gap;
+  cv->setCursor(x, yBase); cv->print(eb); x += textW(eb) + gap;
   drawUpTri(x, yBase - 9, C_GREEN); x += icon;
-  cv->setCursor(x, yBase); cv->print(seg2); x += wSeg2 + gap;
+  cv->setCursor(x, yBase); cv->print(tib); x += textW(tib) + gap;
   drawDownTri(x, yBase - 9, C_ORANGE); x += icon;
-  cv->setCursor(x, yBase); cv->print(seg3);
-
-  /* session name under header, left of dots */
-  cv->setFont(NULL); cv->setTextSize(1);
-  cv->setTextColor(C_PANEL);
+  cv->setCursor(x, yBase); cv->print(tob);
 
   drawHeader();
 }
@@ -442,19 +498,87 @@ static void redraw() {
 /* =========================== input =========================== */
 
 static void applyTap()        { page = (page + 1) % 2; dirty = true; }
-static void applyDoubleTap()  { if (nSes > 1) act = (act + 1) % nSes; dirty = true; }
+static void applyCycle(int d) { if (nSes > 1) act = (act + nSes + d) % nSes; dirty = true; }
 static void applyLongPress()  { flipped = !flipped; prefs.putBool("flip", flipped); dirty = true; }
 
+static void applyAction(uint8_t a, int dir, const char *src) {
+  const char *names[] = {"none", "page", "cycle", "flip"};
+  Serial.printf("[input] %s -> %s\n", src, names[a & 3]);
+  switch (a) {
+    case ACT_PAGE:  applyTap(); break;
+    case ACT_CYCLE: applyCycle(dir); break;
+    case ACT_FLIP:  applyLongPress(); break;
+    default: break;
+  }
+}
+
+/* Gesture engine over real coordinates (CST3530 / AXS backends).
+ * The controller reports in portrait axes: x = short side (0..179),
+ * y = long side (0..639). In landscape, a horizontal swipe is a y-run. */
+static void gestureFrom(const TouchSample &s) {
+  static uint32_t lastGesture = 0;
+  static bool originPending = false;
+  uint32_t now = millis();
+  if (s.down && !touching) {                 // finger down
+    touching = true;
+    holdFired = false;
+    tX0 = tXl = s.x; tY0 = tYl = s.y;
+    originPending = (s.x == 0 && s.y == 0);  // first sample can be junk
+    tDownAt = now;
+  } else if (s.down && touching) {           // drag
+    if (originPending && (s.x || s.y)) {
+      tX0 = s.x; tY0 = s.y;
+      originPending = false;
+    }
+    tXl = s.x; tYl = s.y;
+    if (!holdFired && now - tDownAt > 600 &&
+        abs(tYl - tY0) < 40 && abs(tXl - tX0) < 40) {
+      holdFired = true;
+      lastGesture = now;
+      applyAction(actHold, +1, "hold");
+    }
+  } else if (!s.down && touching) {          // finger up
+    touching = false;
+    if (holdFired) return;
+    // the lift report itself carries coordinates - use them: redraws block
+    // the poll loop long enough that drag samples are often missed entirely
+    if (s.x || s.y) { tXl = s.x; tYl = s.y; }
+    int dy = tYl - tY0;                      // landscape-horizontal travel
+    uint32_t dt = now - tDownAt;
+    // cooldown: the chip emits phantom down/up pairs right after a lift,
+    // which would fire a bogus tap on top of the real swipe (jerkiness)
+    uint32_t sinceLast = now - lastGesture;
+    if (abs(dy) >= 80 && dt < 900 && !originPending && sinceLast > 300) {
+      int dir = (dy < 0) ? +1 : -1;          // swipe toward connector = next
+      if (flipped) dir = -dir;
+      lastGesture = now;
+      Serial.printf("[touch] swipe %+d (dy=%d dt=%lu)\n",
+                    dir, dy, (unsigned long)dt);
+      applyAction(actSwipe, dir, "swipe");
+    } else if (dt < 350 && dt >= 40 && abs(dy) < 40 && sinceLast > 450) {
+      lastGesture = now;
+      Serial.printf("[touch] tap (dy=%d dt=%lu)\n", dy, (unsigned long)dt);
+      applyAction(actTap, +1, "tap");
+    } else {
+      Serial.printf("[touch] ignored (dy=%d dt=%lu since=%lu)\n",
+                    dy, (unsigned long)dt, (unsigned long)sinceLast);
+    }
+  }
+}
+
 static void pollTouch() {
-  // This unit's touch I2C is unreachable, and after any touch the chip
-  // pulses INT indefinitely (unread-data begging), so touch duration can't
-  // be measured. Instead: one clean gesture. A touch after a quiet period
-  // fires immediately (switch page), then touch re-arms once the INT line
-  // has been quiet for a while.
   static uint32_t lastPoll = 0;
-  if (millis() - lastPoll < 30) return;
+  if (millis() - lastPoll < 20) return;
   lastPoll = millis();
 
+  if (touchBE != TOUCH_NONE) {
+    TouchSample s = touchRead(touchBE);
+    if (s.valid) gestureFrom(s);
+    return;
+  }
+
+  // Fallback (no touch chip detected): blind INT-pulse tap. After any touch
+  // the chip pulses INT for a while, so wait for quiet before re-arming.
   static uint32_t lastIrqSeen = 0, lastActivity = 0;
   static bool armed = true;
   uint32_t now = millis();
@@ -464,8 +588,7 @@ static void pollTouch() {
     lastActivity = now;
     if (armed) {
       armed = false;
-      Serial.println("[touch] tap -> page");
-      applyTap();
+      applyAction(actTap, +1, "blind-tap");
     }
   }
   if (!armed && now - lastActivity > 1200) {
@@ -479,8 +602,8 @@ static void pollButton() {
   uint32_t now = millis();
   if (down && !btnWas) btnDownAt = now;
   if (!down && btnWas) {
-    if (now - btnDownAt > 800) applyLongPress();  // long = flip display
-    else applyDoubleTap();                        // short = cycle session
+    if (now - btnDownAt > 800) applyAction(actBtnLong, +1, "boot-long");
+    else                       applyAction(actBtnShort, +1, "boot-short");
   }
   btnWas = down;
 }
@@ -488,7 +611,7 @@ static void pollButton() {
 /* =========================== serial =========================== */
 
 static void handleLine(const char *line) {
-  static StaticJsonDocument<6144> doc;  // static: keep off the loop task stack
+  static StaticJsonDocument<14336> doc;  // static: keep off the loop task stack
   DeserializationError err = deserializeJson(doc, line);
   if (err) {
     Serial.printf("[rx] parse error: %s (len %u)\n", err.c_str(), (unsigned)strlen(line));
@@ -500,13 +623,17 @@ static void handleLine(const char *line) {
     JsonArray arr = doc["ses"].as<JsonArray>();
     int n = 0;
     for (JsonObject o : arr) {
-      if (n >= 4) break;
+      if (n >= MAX_SES) break;
       Sess &s = ses[n];
+      strlcpy(s.pj, o["pj"] | "",      sizeof(s.pj));
       strlcpy(s.nm, o["nm"] | "",      sizeof(s.nm));
       strlcpy(s.md, o["md"] | "Claude", sizeof(s.md));
       strlcpy(s.st, o["st"] | "idle",  sizeof(s.st));
       strlcpy(s.tl, o["tl"] | "",      sizeof(s.tl));
+      strlcpy(s.td, o["td"] | "",      sizeof(s.td));
       strlcpy(s.ef, o["ef"] | "",      sizeof(s.ef));
+      strlcpy(s.tk, o["tk"] | "",      sizeof(s.tk));
+      s.sa = o["sa"] | 0;
       s.el = o["el"] | 0L;
       s.ti = o["ti"] | 0L;
       s.to = o["to"] | 0L;
@@ -515,8 +642,13 @@ static void handleLine(const char *line) {
       n++;
     }
     nSes = n;
+    // Follow the bridge's session pick only when it CHANGES (a real
+    // auto-follow event, e.g. a session starts waiting). Otherwise the
+    // 1/sec packets would stomp a manual BOOT-button selection.
+    static int lastPktAct = -1;
     int a = doc["act"] | 0;
-    if (a >= 0 && a < nSes) act = a;
+    if (a != lastPktAct && a >= 0 && a < nSes) act = a;
+    lastPktAct = a;
     if (doc.containsKey("us")) {
       JsonObject u = doc["us"];
       usage.p5 = u["p5"] | -1;
@@ -529,6 +661,15 @@ static void handleLine(const char *line) {
     dirty = true;
   } else if (!strcmp(t, "ping")) {
     lastPacket = millis();
+  } else if (!strcmp(t, "cf")) {
+    // input bindings from bridge/config.json
+    actTap      = parseAction(doc["tap"] | (const char *)nullptr);
+    actSwipe    = parseAction(doc["swipe"] | (const char *)nullptr);
+    actHold     = parseAction(doc["hold"] | (const char *)nullptr);
+    actBtnShort = parseAction(doc["bshort"] | (const char *)nullptr);
+    actBtnLong  = parseAction(doc["blong"] | (const char *)nullptr);
+    Serial.printf("[cfg] input tap=%d swipe=%d hold=%d bshort=%d blong=%d\n",
+                  actTap, actSwipe, actHold, actBtnShort, actBtnLong);
   } else if (!strcmp(t, "lg")) {
     // logo chunk: {"t":"lg","off":<byte offset>,"px":"<hex>","last":bool}
     if (!logoBuf) return;
@@ -594,7 +735,9 @@ void setup() {
   digitalWrite(TOUCH_RES, HIGH); delay(2);
   digitalWrite(TOUCH_RES, LOW);  delay(100);
   digitalWrite(TOUCH_RES, HIGH); delay(2);
+  Wire.setBufferSize(1100);   // CST3530 fw upload sends 1026-byte writes
   Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL);
+  Wire.setClock(200000);      // hyn driver runs the bus at 200 kHz
 
   // SY6970 battery-charger config (required for stable power w/o battery):
   // disable ILIM pin + max input current limit; turn off BATFET
@@ -629,6 +772,23 @@ void setup() {
   pushCanvas();
   Serial.println("[boot] splash pushed OK");
   delay(600);
+
+  // touch: detect which revision's controller we have and bring it up.
+  // Done after display init: the AXS integrated touch (old revision) only
+  // answers once the panel is initialized, and the CST path pulses its own
+  // reset (GPIO2), which is safe on old boards where that pin is unused.
+  touchBE = touchDetect();
+  if (touchBE == TOUCH_CST) {
+    Serial.println("[touch] CST3530 detected (new hw revision)");
+    if (!cstInit()) {
+      Serial.println("[touch] CST init failed - falling back to blind-tap");
+      touchBE = TOUCH_NONE;
+    }
+  } else if (touchBE == TOUCH_AXS) {
+    Serial.println("[touch] AXS15231B integrated touch detected (old hw revision)");
+  } else {
+    Serial.println("[touch] no touch controller answered - blind-tap fallback");
+  }
 
   // load saved logo, if one was uploaded
   logoBuf = (uint16_t *)malloc(LOGO_BYTES);

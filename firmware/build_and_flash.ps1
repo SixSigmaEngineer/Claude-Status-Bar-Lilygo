@@ -100,6 +100,15 @@ if ($needDriver) {
         ForEach-Object { Copy-Item $_.FullName $Sketch -Force }
 }
 
+# ---------- 3a. CST3530 touch firmware blob (new hw revision) ----------
+$cstFw = Join-Path $Sketch "cst3530_fw.h"
+if (-not (Test-Path $cstFw)) {
+    Step "Downloading CST3530 touch firmware blob..."
+    try {
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Xinyuan-LilyGO/T-Display-S3-Long/T-Display-S3-Long-cst3530/lib/hyn_driver_for_esp32/hyn_chips/cst3530_fw.h" -OutFile $cstFw
+    } catch { Write-Host "  (download failed - continuing without touch-fw upload support)" }
+}
+
 # ---------- 3b. LVGL (the LilyGo driver #includes it) ----------
 $lvglDir = Join-Path $Build "user\libraries\lvgl"
 if (-not (Test-Path $lvglDir)) {

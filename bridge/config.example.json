@@ -1,7 +1,7 @@
 {
   "_comment": "Copy to config.json to customize. All keys optional.",
   "port": "",
-  "max_sessions": 4,
+  "max_sessions": 8,
   "active_window_min": 30,
   "idle_after_s": 120,
   "wait_tool_s": 20,
@@ -9,5 +9,13 @@
   "done_after_s": 30,
   "est_cap_5h_tokens": 8000000,
   "est_cap_7d_tokens": 60000000,
-  "send_interval_s": 1.0
+  "send_interval_s": 1.0,
+  "_input_comment": "actions: cycle | page | usage | flip | none (pushed to display on connect)",
+  "input": {
+    "tap": "cycle",
+    "swipe": "cycle",
+    "hold": "usage",
+    "boot_short": "cycle",
+    "boot_long": "flip"
+  }
 }
