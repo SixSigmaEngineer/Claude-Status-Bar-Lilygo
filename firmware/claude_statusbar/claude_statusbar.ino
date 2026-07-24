@@ -551,8 +551,13 @@ static void handleLine(const char *line) {
       n++;
     }
     nSes = n;
+    // Follow the bridge's session pick only when it CHANGES (a real
+    // auto-follow event, e.g. a session starts waiting). Otherwise the
+    // 1/sec packets would stomp a manual BOOT-button selection.
+    static int lastPktAct = -1;
     int a = doc["act"] | 0;
-    if (a >= 0 && a < nSes) act = a;
+    if (a != lastPktAct && a >= 0 && a < nSes) act = a;
+    lastPktAct = a;
     if (doc.containsKey("us")) {
       JsonObject u = doc["us"];
       usage.p5 = u["p5"] | -1;

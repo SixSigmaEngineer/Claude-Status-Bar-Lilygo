@@ -346,9 +346,9 @@ def find_transcripts(roots):
     for root in roots:
         if not os.path.isdir(root):
             continue
-        for dirpath, _dirs, files in os.walk(root):
-            if os.path.basename(dirpath) == "subagents":
-                continue   # subagent helpers aren't top-level sessions
+        for dirpath, dirs, files in os.walk(root):
+            if "subagents" in dirs:
+                dirs.remove("subagents")   # helper agents aren't top-level sessions
             for fn in files:
                 if fn.endswith(".jsonl") and fn != "audit.jsonl":
                     path = os.path.join(dirpath, fn)
