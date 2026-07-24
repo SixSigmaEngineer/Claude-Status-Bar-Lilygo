@@ -150,6 +150,47 @@ def pretty_tool(name):
     return name[:16]
 
 
+_MODEL_CTX_CACHE = {}     # model_id -> (context_window, fetched_at)
+
+# offline fallback only - the Models API is the source of truth
+_MODEL_CTX_FALLBACK = (
+    ("haiku", 200000),
+    ("fable", 1000000), ("mythos", 1000000),
+    ("sonnet-5", 1000000), ("sonnet-4-6", 1000000),
+    ("opus-4-8", 1000000), ("opus-4-7", 1000000), ("opus-4-6", 1000000),
+)
+
+
+def model_context_limit(model_id, default):
+    """Per-model context window via the Models API (max_input_tokens),
+    cached per model id; falls back to a static table, then `default`."""
+    if not model_id:
+        return default
+    hit = _MODEL_CTX_CACHE.get(model_id)
+    if hit and (hit[0] or time.time() - hit[1] < 600):
+        return hit[0] or default
+    limit = 0
+    try:
+        token = UsageTracker._oauth_token()
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.anthropic.com/v1/models/{model_id}",
+            headers={"Authorization": f"Bearer {token}",
+                     "anthropic-version": "2023-06-01",
+                     "anthropic-beta": "oauth-2025-04-20"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            limit = int(json.loads(r.read().decode()).get("max_input_tokens") or 0)
+    except Exception:
+        pass
+    if not limit:
+        for key, val in _MODEL_CTX_FALLBACK:
+            if key in model_id:
+                limit = val
+                break
+    _MODEL_CTX_CACHE[model_id] = (limit, time.time())
+    return limit or default
+
+
 def fmt_tokens(v):
     if v >= 1000000:
         return f"{v / 1e6:.1f}M"
@@ -346,6 +387,13 @@ class Session:
             # Claude explicitly asked a question - waiting, no threshold
             return "wait", "Question", pending[2]
 
+        # Orchestration tools legitimately run for minutes with no writes to
+        # the main transcript (subagents write elsewhere) - never read them
+        # as permission prompts. Active subagent files are proof of work.
+        LONG_TOOLS = ("Task", "Agent", "Workflow", "TaskOutput", "Monitor")
+        if pending and (pending[0] in LONG_TOOLS or self.subagent_count() > 0):
+            return "tool", pending[0], pending[2]
+
         if fresh:
             if pending:
                 name, pts, detail = pending
@@ -395,9 +443,9 @@ class Session:
             if st in ("run", "tool"):
                 end = time.time()
             el = max(0, int(end - self.turn_start))
-        # context window self-calibration: if we've measured more tokens than
-        # the configured window, this session is on a 1M-context plan
-        limit = cfg["context_limit"]
+        # context window: per-model via the Models API, config as fallback;
+        # if we've measured more tokens than the limit, it's clearly bigger
+        limit = model_context_limit(self.model, cfg["context_limit"])
         if self.ctx_tokens > limit:
             limit = 1000000
         ctx = int(round(100.0 * self.ctx_tokens / limit))

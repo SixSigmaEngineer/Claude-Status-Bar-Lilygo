@@ -472,12 +472,19 @@ static void applyLongPress()  { flipped = !flipped; prefs.putBool("flip", flippe
  * The controller reports in portrait axes: x = short side (0..179),
  * y = long side (0..639). In landscape, a horizontal swipe is a y-run. */
 static void gestureFrom(const TouchSample &s) {
+  static uint32_t lastGesture = 0;
+  static bool originPending = false;
   uint32_t now = millis();
   if (s.down && !touching) {                 // finger down
     touching = true;
     tX0 = tXl = s.x; tY0 = tYl = s.y;
+    originPending = (s.x == 0 && s.y == 0);  // first sample can be junk
     tDownAt = now;
   } else if (s.down && touching) {           // drag
+    if (originPending && (s.x || s.y)) {
+      tX0 = s.x; tY0 = s.y;
+      originPending = false;
+    }
     tXl = s.x; tYl = s.y;
   } else if (!s.down && touching) {          // finger up
     touching = false;
@@ -486,16 +493,24 @@ static void gestureFrom(const TouchSample &s) {
     if (s.x || s.y) { tXl = s.x; tYl = s.y; }
     int dy = tYl - tY0;                      // landscape-horizontal travel
     uint32_t dt = now - tDownAt;
-    if (abs(dy) >= 80 && dt < 900) {
+    // cooldown: the chip emits phantom down/up pairs right after a lift,
+    // which would fire a bogus tap on top of the real swipe (jerkiness)
+    uint32_t sinceLast = now - lastGesture;
+    if (abs(dy) >= 80 && dt < 900 && !originPending && sinceLast > 300) {
       int dir = (dy < 0) ? +1 : -1;          // swipe toward connector = next
       if (flipped) dir = -dir;
+      lastGesture = now;
       Serial.printf("[touch] swipe %+d (dy=%d dt=%lu) -> session\n",
                     dir, dy, (unsigned long)dt);
       applyCycle(dir);
-    } else if (dt < 350 && abs(dy) < 40) {
+    } else if (dt < 350 && dt >= 40 && abs(dy) < 40 && sinceLast > 450) {
+      lastGesture = now;
       Serial.printf("[touch] tap (dy=%d dt=%lu) -> page\n",
                     dy, (unsigned long)dt);
       applyTap();
+    } else {
+      Serial.printf("[touch] ignored (dy=%d dt=%lu since=%lu)\n",
+                    dy, (unsigned long)dt, (unsigned long)sinceLast);
     }
     // touch-hold (no swipe) is deliberately unbound - reserved
   }
