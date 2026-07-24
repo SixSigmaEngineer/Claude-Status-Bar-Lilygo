@@ -10,6 +10,7 @@ firmware/claude_statusbar/pins_config.h
 # bridge local state
 bridge/config.json
 bridge/logo.bin
+bridge/.venv/
 __pycache__/
 *.pyc
 

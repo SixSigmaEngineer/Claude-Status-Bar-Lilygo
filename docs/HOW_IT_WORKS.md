@@ -12,7 +12,12 @@ Three pieces:
 
 3. **Rendering (ESP32-S3).** The bridge sends one compact JSON line per second over USB CDC serial. The firmware draws into a 640×180 canvas (Adafruit GFX) and pushes it to the panel via LilyGo's AXS15231B QSPI driver.
 
-## Where transcripts live on Windows
+## Where transcripts live
+
+- Claude Code (all platforms): `~/.claude/projects/<cwd-slug>/<uuid>.jsonl` — same layout everywhere; `CLAUDE_CONFIG_DIR` relocates the tree and the bridge honors it.
+- Claude Desktop (Cowork) on macOS: `~/Library/Application Support/Claude/local-agent-mode-sessions/...`; on Linux: `~/.config/Claude/local-agent-mode-sessions/...`.
+
+### Windows specifics
 
 - Claude Code: `%USERPROFILE%\.claude\projects\<cwd-slug>\<uuid>.jsonl`
 - Claude Desktop (Cowork): **not** where you'd expect. The app is MSIX-packaged, so its writes to `%APPDATA%\Claude\...` are silently virtualized to:
