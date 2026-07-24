@@ -75,7 +75,7 @@
 /* ---------- state ---------- */
 struct Sess {
   char pj[22];  // project (cwd basename)
-  char nm[40];  // session title (custom > ai-title > summary)
+  char nm[58];  // session title (custom > ai-title > summary)
   char md[22];  // model, e.g. "Fable 5"
   char st[10];  // run | tool | wait | idle | done
   char tl[22];  // tool name
@@ -155,6 +155,27 @@ static void drawCentered(const char *s, int cx0, int cx1, int baseY, uint16_t co
   cv->setTextColor(color);
   cv->setCursor(x, baseY);
   cv->print(s);
+}
+
+/* print, truncating with an ellipsis only when the text actually exceeds
+ * maxX (pixel-measured, not a blind character cutoff) */
+static void printTruncated(const char *s, int x, int baseY, int maxX,
+                           uint16_t color) {
+  char buf[64];
+  strlcpy(buf, s, sizeof(buf));
+  cv->setTextColor(color);
+  cv->setCursor(x, baseY);
+  if (x + textW(buf) <= maxX) {
+    cv->print(buf);
+    return;
+  }
+  int len = strlen(buf);
+  int dots = textW("...");
+  while (len > 1 && x + textW(buf) + dots > maxX) {
+    buf[--len] = 0;
+  }
+  cv->print(buf);
+  cv->print("...");
 }
 
 static uint16_t ctxColor(int pct) {
@@ -309,12 +330,7 @@ static void drawStatusPage() {
 
   /* ----- row 1: PROJECT (the thing that ties display to session) ----- */
   {
-    const char *pj = s.pj[0] ? s.pj : (s.nm[0] ? s.nm : "Claude");
-    cv->setFont(&FreeSansBold12pt7b);
-    cv->setTextColor(C_TEXT);
-    cv->setCursor(zone0, 40);
-    cv->print(pj);
-    // model · effort, right-aligned on the same row
+    // model · effort, right-aligned; project truncates against it
     char mline[36];
     if (s.ef[0]) snprintf(mline, sizeof(mline), "%s · %s", s.md, s.ef);
     else         strlcpy(mline, s.md, sizeof(mline));
@@ -323,14 +339,16 @@ static void drawStatusPage() {
     cv->setTextColor(C_DIM);
     cv->setCursor(zone1 - mw, 38);
     cv->print(mline);
+
+    const char *pj = s.pj[0] ? s.pj : (s.nm[0] ? s.nm : "Claude");
+    cv->setFont(&FreeSansBold12pt7b);
+    printTruncated(pj, zone0, 40, zone1 - mw - 14, C_TEXT);
   }
 
-  /* ----- row 2: session title (ai-title) ----- */
+  /* ----- row 2: session title (custom rename > ai-title) ----- */
   if (s.pj[0] && s.nm[0]) {
     cv->setFont(&FreeSans9pt7b);
-    cv->setTextColor(C_DIM);
-    cv->setCursor(zone0, 64);
-    cv->print(s.nm);
+    printTruncated(s.nm, zone0, 64, zone1, C_DIM);
   }
 
   /* ----- row 3: state word (real state, no clodisms) ----- */
@@ -377,9 +395,7 @@ static void drawStatusPage() {
     }
     if (dline[0]) {
       cv->setFont(&FreeSans9pt7b);
-      cv->setTextColor(C_DIM);
-      cv->setCursor(zone0 + 8, 137);
-      cv->print(dline);
+      printTruncated(dline, zone0 + 8, 137, zone1, C_DIM);
     }
   }
 

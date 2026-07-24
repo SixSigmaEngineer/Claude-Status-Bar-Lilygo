@@ -453,7 +453,7 @@ class Session:
                  or os.path.basename(os.path.dirname(self.path))[:24])
         return {
             "pj": self.project[:20],
-            "nm": title[:38],
+            "nm": title[:56],
             "md": pretty_model(self.model),
             "st": st,
             "tl": pretty_tool(tool),
