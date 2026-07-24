@@ -104,6 +104,8 @@ class BridgeThread(threading.Thread):
             self.connected = self.link.ser is not None
             if self.link.ser is not None and (self.link.ser is not self._last_ser
                                               or self.logo_dirty):
+                if self.link.ser is not self._last_ser:
+                    self.link.send(bridge.input_cfg_packet(self.cfg))
                 self._last_ser = self.link.ser
                 self.logo_dirty = False
                 self._send_logo()

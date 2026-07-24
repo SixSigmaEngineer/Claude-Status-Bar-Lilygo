@@ -82,10 +82,13 @@ The image in the top-left corner of the screen is yours to change: open the app 
 
 ## Controls
 
+All bindings are remappable in `bridge/config.json` under `"input"` (actions: `cycle`, `page`, `usage`, `flip`, `none`). Defaults:
+
 | Action | Result |
 |---|---|
-| Tap screen | Switch page (status ↔ usage) |
-| Swipe left / right | Cycle session (A through H) |
+| Tap screen | Cycle session (A through H) |
+| Swipe left / right | Cycle session |
+| Touch and hold (0.6s) | Usage page (toggle) |
 | BOOT button, short press | Cycle session |
 | BOOT button, hold 1s | Flip display 180° (saved) |
 

@@ -76,6 +76,16 @@ DEFAULT_CONFIG = {
     "est_cap_5h_tokens": 8000000,    # only used if OAuth usage API unavailable
     "est_cap_7d_tokens": 60000000,
     "send_interval_s": 1.0,
+    # input bindings, pushed to the display on connect. Actions:
+    # "cycle" (next/prev session), "page" (toggle status/usage),
+    # "usage" (alias of page), "flip" (rotate 180), "none"
+    "input": {
+        "tap": "cycle",
+        "swipe": "cycle",
+        "hold": "usage",
+        "boot_short": "cycle",
+        "boot_long": "flip",
+    },
 }
 
 
@@ -102,10 +112,24 @@ def load_config():
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                cfg.update(json.load(f))
+                user = json.load(f)
+            inp = dict(DEFAULT_CONFIG["input"])
+            inp.update(user.get("input") or {})
+            cfg.update(user)
+            cfg["input"] = inp
         except Exception as e:
             print(f"[warn] bad config.json ignored: {e}")
     return cfg
+
+
+def input_cfg_packet(cfg):
+    """One-line input-binding packet, sent to the display on connect."""
+    i = cfg["input"]
+    pkt = {"t": "cf", "tap": i.get("tap", "cycle"),
+           "swipe": i.get("swipe", "cycle"), "hold": i.get("hold", "usage"),
+           "bshort": i.get("boot_short", "cycle"),
+           "blong": i.get("boot_long", "flip")}
+    return json.dumps(pkt, separators=(",", ":")) + "\n"
 
 
 # ---------------------------------------------------------------- helpers
@@ -782,6 +806,7 @@ def main():
             link.send(line)
             if link.ser is not None and link.ser is not last_ser:
                 last_ser = link.ser
+                link.send(input_cfg_packet(cfg))
                 send_logo()
         else:
             sys.stdout.write(line)
