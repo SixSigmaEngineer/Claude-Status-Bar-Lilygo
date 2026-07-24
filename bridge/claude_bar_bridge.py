@@ -20,6 +20,8 @@ import argparse
 import glob
 import json
 import os
+import platform
+import subprocess
 import sys
 import time
 from collections import deque
@@ -27,25 +29,37 @@ from datetime import datetime, timezone
 
 # ---------------------------------------------------------------- config
 
+IS_WINDOWS = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
+
 APPDATA = os.environ.get("APPDATA", os.path.expanduser("~\\AppData\\Roaming"))
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
 HOME = os.path.expanduser("~")
 
+# CLAUDE_CONFIG_DIR relocates the whole ~/.claude tree (all platforms)
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+
 
 def default_roots():
-    roots = [
-        os.path.join(HOME, ".claude", "projects"),
-        os.path.join(APPDATA, "Claude", "local-agent-mode-sessions"),
-    ]
-    # The MSIX-packaged Claude Desktop app virtualizes its AppData writes to
-    # AppData\Local\Packages\Claude_*\LocalCache\Roaming\Claude\...
-    pkg_root = os.path.join(LOCALAPPDATA, "Packages")
-    if os.path.isdir(pkg_root):
-        for name in os.listdir(pkg_root):
-            if "claude" in name.lower():
-                roots.append(os.path.join(
-                    pkg_root, name, "LocalCache", "Roaming", "Claude",
-                    "local-agent-mode-sessions"))
+    roots = [os.path.join(CLAUDE_DIR, "projects")]   # Claude Code, all platforms
+    if IS_WINDOWS:
+        roots.append(os.path.join(APPDATA, "Claude", "local-agent-mode-sessions"))
+        # The MSIX-packaged Claude Desktop app virtualizes its AppData writes to
+        # AppData\Local\Packages\Claude_*\LocalCache\Roaming\Claude\...
+        pkg_root = os.path.join(LOCALAPPDATA, "Packages")
+        if os.path.isdir(pkg_root):
+            for name in os.listdir(pkg_root):
+                if "claude" in name.lower():
+                    roots.append(os.path.join(
+                        pkg_root, name, "LocalCache", "Roaming", "Claude",
+                        "local-agent-mode-sessions"))
+    elif IS_MAC:
+        roots.append(os.path.join(HOME, "Library", "Application Support",
+                                  "Claude", "local-agent-mode-sessions"))
+    else:  # Linux
+        roots.append(os.path.join(
+            os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+            "Claude", "local-agent-mode-sessions"))
     return roots
 
 
@@ -53,7 +67,7 @@ DEFAULT_CONFIG = {
     "roots": default_roots(),
     "port": "",                  # "" = auto-detect (ESP32-S3 native USB)
     "baud": 115200,
-    "max_sessions": 4,
+    "max_sessions": 8,
     "active_window_min": 30,     # sessions modified within N minutes are shown
     "idle_after_s": 120,         # no file writes for this long -> idle/done
     "wait_tool_s": 20,           # pending tool call older than this -> "waiting on you"
@@ -67,9 +81,16 @@ DEFAULT_CONFIG = {
 
 def data_dir():
     """Where config.json / logo.bin live. Next to the scripts normally;
-    %APPDATA%\\ClaudeStatusBar when running as a packaged exe."""
+    a per-user app-data dir when running as a packaged exe."""
     if getattr(sys, "frozen", False):
-        d = os.path.join(APPDATA, "ClaudeStatusBar")
+        if IS_WINDOWS:
+            d = os.path.join(APPDATA, "ClaudeStatusBar")
+        elif IS_MAC:
+            d = os.path.join(HOME, "Library", "Application Support", "ClaudeStatusBar")
+        else:
+            d = os.path.join(
+                os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+                "ClaudeStatusBar")
         os.makedirs(d, exist_ok=True)
         return d
     return os.path.dirname(os.path.abspath(__file__))
@@ -129,6 +150,76 @@ def pretty_tool(name):
     return name[:16]
 
 
+_MODEL_CTX_CACHE = {}     # model_id -> (context_window, fetched_at)
+
+# offline fallback only - the Models API is the source of truth
+_MODEL_CTX_FALLBACK = (
+    ("haiku", 200000),
+    ("fable", 1000000), ("mythos", 1000000),
+    ("sonnet-5", 1000000), ("sonnet-4-6", 1000000),
+    ("opus-4-8", 1000000), ("opus-4-7", 1000000), ("opus-4-6", 1000000),
+)
+
+
+def model_context_limit(model_id, default):
+    """Per-model context window via the Models API (max_input_tokens),
+    cached per model id; falls back to a static table, then `default`."""
+    if not model_id:
+        return default
+    hit = _MODEL_CTX_CACHE.get(model_id)
+    if hit and (hit[0] or time.time() - hit[1] < 600):
+        return hit[0] or default
+    limit = 0
+    try:
+        token = UsageTracker._oauth_token()
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.anthropic.com/v1/models/{model_id}",
+            headers={"Authorization": f"Bearer {token}",
+                     "anthropic-version": "2023-06-01",
+                     "anthropic-beta": "oauth-2025-04-20"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            limit = int(json.loads(r.read().decode()).get("max_input_tokens") or 0)
+    except Exception:
+        pass
+    if not limit:
+        for key, val in _MODEL_CTX_FALLBACK:
+            if key in model_id:
+                limit = val
+                break
+    _MODEL_CTX_CACHE[model_id] = (limit, time.time())
+    return limit or default
+
+
+def fmt_tokens(v):
+    if v >= 1000000:
+        return f"{v / 1e6:.1f}M"
+    if v >= 1000:
+        return f"{v // 1000}k"
+    return str(v)
+
+
+def tool_detail(inp):
+    """One-line 'what is this tool doing' from its input, octomux-style:
+    first non-empty of a priority list; basenames for path-ish fields."""
+    if not isinstance(inp, dict):
+        return ""
+    qs = inp.get("questions")
+    if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+        q = qs[0].get("question", "")
+        if q:
+            return " ".join(q.split())[:36]
+    for key in ("command", "file_path", "target_file", "notebook_path",
+                "pattern", "url", "query", "description", "path", "prompt"):
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            v = " ".join(v.split())
+            if key.endswith("path") or key == "target_file":
+                v = os.path.basename(v)
+            return v[:36]
+    return ""
+
+
 def fmt_countdown(seconds):
     if seconds is None or seconds < 0:
         return ""
@@ -149,7 +240,12 @@ class Session:
         self.path = path
         self.offset = 0
         self.name = ""
+        self.project = ""             # basename of the session's cwd
+        self.ai_title = ""            # Claude Code's generated session title
+        self.custom_title = ""        # user-set title (wins over ai_title)
         self.model = ""
+        self._sa_count = 0            # active subagent transcripts
+        self._sa_checked = 0
         self.tok_in = 0
         self.tok_out = 0
         self.ctx_tokens = 0
@@ -203,6 +299,22 @@ class Session:
                 self.name = s[:24]
             return
 
+        if rtype == "ai-title":
+            t = rec.get("aiTitle") or rec.get("title") or ""
+            if t:
+                self.ai_title = t.strip()
+            return
+
+        if rtype == "custom-title":
+            t = rec.get("customTitle") or rec.get("title") or ""
+            if t:
+                self.custom_title = t.strip()
+            return
+
+        cwd = rec.get("cwd")
+        if cwd and not self.project:
+            self.project = os.path.basename(cwd.rstrip("/\\")) or cwd
+
         if rec.get("isSidechain"):
             return
 
@@ -251,7 +363,8 @@ class Session:
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "tool_use":
-                    self.pending_ids[b.get("id", "")] = (b.get("name", "Tool"), ts)
+                    self.pending_ids[b.get("id", "")] = (
+                        b.get("name", "Tool"), ts, tool_detail(b.get("input")))
                 elif b.get("type") == "text":
                     text += b.get("text", "")
             if text:
@@ -261,6 +374,7 @@ class Session:
 
     # ---- derived state ----
     def state(self, cfg):
+        """-> (state, tool_name, detail)"""
         now = time.time()
         mtime = safe_mtime(self.path)
         fresh = (now - mtime) < cfg["idle_after_s"]
@@ -269,48 +383,88 @@ class Session:
         if self.pending_ids:
             pending = sorted(self.pending_ids.values(), key=lambda v: v[1])[-1]
 
+        if pending and pending[0] == "AskUserQuestion":
+            # Claude explicitly asked a question - waiting, no threshold
+            return "wait", "Question", pending[2]
+
+        # Orchestration tools legitimately run for minutes with no writes to
+        # the main transcript (subagents write elsewhere) - never read them
+        # as permission prompts. Active subagent files are proof of work.
+        LONG_TOOLS = ("Task", "Agent", "Workflow", "TaskOutput", "Monitor")
+        if pending and (pending[0] in LONG_TOOLS or self.subagent_count() > 0):
+            return "tool", pending[0], pending[2]
+
         if fresh:
             if pending:
-                name, pts = pending
+                name, pts, detail = pending
                 if now - pts > cfg["wait_tool_s"] and now - mtime > cfg["wait_tool_s"]:
-                    return "wait", name          # likely a permission prompt
-                return "tool", name
+                    return "wait", name, detail   # likely a permission prompt
+                return "tool", name, detail
             # no pending tools: if the last thing was an assistant message and
             # nothing new has been written for a while, the turn is over
             if self.last_role == "assistant" and now - mtime > cfg["done_after_s"]:
                 if self.last_assistant_text.rstrip().endswith("?"):
-                    return "wait", ""
-                return "done", ""
-            return "run", ""
+                    return "wait", "", ""
+                return "done", "", ""
+            return "run", "", ""
         # stale
         if pending:
-            return "wait", pending[0]
+            return "wait", pending[0], pending[2]
         if self.last_assistant_text.rstrip().endswith("?"):
-            return "wait", ""
+            return "wait", "", ""
         if self.last_role == "assistant":
-            return "done", ""
-        return "idle", ""
+            return "done", "", ""
+        return "idle", "", ""
+
+    def subagent_count(self):
+        """Active helper-agent transcripts under <slug>/<session-uuid>/subagents."""
+        now = time.time()
+        if now - self._sa_checked < 10:
+            return self._sa_count
+        self._sa_checked = now
+        n = 0
+        base = os.path.join(os.path.dirname(self.path),
+                            os.path.splitext(os.path.basename(self.path))[0],
+                            "subagents")
+        if os.path.isdir(base):
+            for dirpath, _dirs, files in os.walk(base):
+                for fn in files:
+                    if fn.startswith("agent-") and fn.endswith(".jsonl"):
+                        if now - safe_mtime(os.path.join(dirpath, fn)) < 90:
+                            n += 1
+        self._sa_count = n
+        return n
 
     def to_packet(self, cfg):
-        st, tool = self.state(cfg)
+        st, tool, detail = self.state(cfg)
         el = 0
         if self.turn_start:
             end = self.last_event_ts or time.time()
             if st in ("run", "tool"):
                 end = time.time()
             el = max(0, int(end - self.turn_start))
-        ctx = int(round(100.0 * self.ctx_tokens / cfg["context_limit"]))
-        display_name = self.name or os.path.basename(os.path.dirname(self.path))[:24]
+        # context window: per-model via the Models API, config as fallback;
+        # if we've measured more tokens than the limit, it's clearly bigger
+        limit = model_context_limit(self.model, cfg["context_limit"])
+        if self.ctx_tokens > limit:
+            limit = 1000000
+        ctx = int(round(100.0 * self.ctx_tokens / limit))
+        title = (self.custom_title or self.ai_title or self.name
+                 or os.path.basename(os.path.dirname(self.path))[:24])
         return {
-            "nm": display_name,
+            "pj": self.project[:20],
+            "nm": title[:56],
             "md": pretty_model(self.model),
             "st": st,
             "tl": pretty_tool(tool),
+            "td": detail[:32],
+            "sa": self.subagent_count(),
             "ef": self.effort,
             "el": el,
             "ti": self.tok_in,
             "to": self.tok_out,
             "cx": min(ctx, 100),
+            "tk": fmt_tokens(self.ctx_tokens),
             "at": st == "wait",
         }
 
@@ -325,9 +479,9 @@ def find_transcripts(roots):
     for root in roots:
         if not os.path.isdir(root):
             continue
-        for dirpath, _dirs, files in os.walk(root):
-            if os.path.basename(dirpath) == "subagents":
-                continue   # subagent helpers aren't top-level sessions
+        for dirpath, dirs, files in os.walk(root):
+            if "subagents" in dirs:
+                dirs.remove("subagents")   # helper agents aren't top-level sessions
             for fn in files:
                 if fn.endswith(".jsonl") and fn != "audit.jsonl":
                     path = os.path.join(dirpath, fn)
@@ -358,14 +512,33 @@ class UsageTracker:
         while self.events and self.events[0][0] < cutoff:
             self.events.popleft()
 
+    @staticmethod
+    def _oauth_token():
+        """Claude Code login token: .credentials.json on Windows/Linux,
+        the login Keychain on macOS. The file is checked first on every
+        platform since macOS uses it as an override in SSH/tmux setups."""
+        cred_path = os.path.join(CLAUDE_DIR, ".credentials.json")
+        blob = None
+        if os.path.exists(cred_path):
+            with open(cred_path, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+        elif IS_MAC:
+            out = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=10)
+            if out.returncode == 0 and out.stdout.strip():
+                blob = json.loads(out.stdout.strip())
+        if not blob:
+            raise FileNotFoundError("no Claude Code credentials")
+        return blob["claudeAiOauth"]["accessToken"]
+
     def _try_api(self):
         if time.time() - self.api_checked < 60:
             return self.api_cache
         self.api_checked = time.time()
-        cred_path = os.path.join(HOME, ".claude", ".credentials.json")
         try:
-            with open(cred_path, "r", encoding="utf-8") as f:
-                token = json.load(f)["claudeAiOauth"]["accessToken"]
+            token = self._oauth_token()
             import urllib.request
             req = urllib.request.Request(
                 "https://api.anthropic.com/api/oauth/usage",
@@ -415,10 +588,16 @@ class SerialLink:
 
     def _detect(self):
         from serial.tools import list_ports
-        for p in list_ports.comports():
+        ports = list(list_ports.comports())
+        for p in ports:
             if (p.vid, p.pid) in self.VID_PID:
                 return p.device
-        ports = list(list_ports.comports())
+        # fall back to anything that looks like a USB serial device
+        # (avoids grabbing Bluetooth/debug ports on macOS)
+        usb = [p for p in ports if any(k in p.device for k in
+               ("usbmodem", "usbserial", "ttyACM", "ttyUSB", "COM"))]
+        if len(usb) == 1:
+            return usb[0].device
         return ports[0].device if len(ports) == 1 else None
 
     def send(self, text):
@@ -498,12 +677,16 @@ def demo_packets():
         st, tl, cx = next(states)
         yield {
             "t": "s",
-            "ses": [{"nm": "Demo", "md": "Fable 5", "st": st, "tl": tl,
+            "ses": [{"pj": "DemoProject", "nm": "Fix the flux capacitor",
+                     "md": "Fable 5", "st": st, "tl": tl,
+                     "td": "npm test" if tl else "", "sa": 2,
                      "ef": "medium", "el": int(time.time() - t0),
-                     "ti": 56500, "to": 4700, "cx": cx, "at": st == "wait"},
-                    {"nm": "Second", "md": "Opus 4.8", "st": "run", "tl": "",
-                     "ef": "xhigh", "el": 64, "ti": 37700, "to": 3200,
-                     "cx": 55, "at": False}],
+                     "ti": 56500, "to": 4700, "cx": cx, "tk": "12k",
+                     "at": st == "wait"},
+                    {"pj": "SecondProj", "nm": "Refactor auth flow",
+                     "md": "Opus 4.8", "st": "run", "tl": "", "td": "",
+                     "sa": 0, "ef": "xhigh", "el": 64, "ti": 37700,
+                     "to": 3200, "cx": 55, "tk": "110k", "at": False}],
             "act": 0,
             "us": {"p5": 11, "p7": 34, "r5": "36m", "r7": "5d10h", "est": True},
         }
