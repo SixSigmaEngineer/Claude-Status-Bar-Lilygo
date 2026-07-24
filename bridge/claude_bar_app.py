@@ -399,37 +399,42 @@ class App:
                       font=("Segoe UI", 20, "bold"), anchor="w")
         c.create_line(178, 18, 178, 166, fill=PANEL)
 
-        # center: model above state
-        mid = 190 + (self.W - 10 - 190) / 2
+        # center: project / title / state / detail
+        z0 = 196
+        pj = s.get("pj") or s.get("nm") or "Claude"
+        c.create_text(z0, 32, text=pj, fill=TEXT, anchor="w",
+                      font=("Segoe UI", 15, "bold"))
         mline = s.get("md", "Claude")
         if s.get("ef"):
-            mline += f"  ·  {s['ef']}"
-        c.create_text(mid, 32, text=mline, fill=DIM, font=("Segoe UI", 11))
+            mline += f" · {s['ef']}"
+        c.create_text(self.W - 10, 32, text=mline, fill=DIM, anchor="e",
+                      font=("Segoe UI", 10))
+        if s.get("pj") and s.get("nm"):
+            c.create_text(z0, 58, text=s["nm"], fill=DIM, anchor="w",
+                          font=("Segoe UI", 10))
 
         st = s.get("st", "idle")
-        run_words = ["Clauding...", "Thinking...", "Percolating...",
-                     "Reflecting...", "Considering...", "Analyzing...",
-                     "Reasoning...", "Reviewing...", "Drafting...",
-                     "Refining...", "Pondering...", "Ruminating...",
-                     "Cogitating...", "Synthesizing...", "Noodling...",
-                     "Brewing..."]
-        import random
-        now = time.time()
-        if st == "run":
-            if not hasattr(self, "_rw_at") or now - self._rw_at > 7:
-                self._rw = random.choice(run_words)
-                self._rw_at = now
-        else:
-            self._rw_at = 0
         word, col = {
             "tool": (s.get("tl") or "Tool", TEXT),
-            "run": (getattr(self, "_rw", "Clauding..."), TEXT),
+            "run": ("Running", TEXT),
             "wait": ("Waiting on you", ORANGE),
             "done": ("Done", GREEN),
         }.get(st, ("Idle", DIM))
         prefix = "✦ " if st in ("run", "tool") else ""
-        c.create_text(mid, 88, text=prefix + word, fill=col,
-                      font=("Segoe UI", 26, "bold"))
+        c.create_text(z0 + 8, 100, text=prefix + word, fill=col, anchor="w",
+                      font=("Segoe UI", 24, "bold"))
+
+        dline = ""
+        if st == "wait" and s.get("tl") and s.get("tl") != "Question":
+            dline = f"approve: {s['tl']}" + (f" · {s['td']}" if s.get("td") else "")
+        elif s.get("td"):
+            dline = s["td"]
+        if s.get("sa"):
+            dline += ("· " if not dline else " · ") + \
+                     f"{s['sa']} subagent{'s' if s['sa'] > 1 else ''}"
+        if dline:
+            c.create_text(z0 + 10, 130, text=dline, fill=DIM, anchor="w",
+                          font=("Segoe UI", 10))
 
         def fmt_k(v):
             v = v or 0
@@ -441,8 +446,8 @@ class App:
 
         el = s.get("el", 0)
         eb = f"{el}s" if el < 180 else f"{el // 60}m{el % 60:02d}s"
-        c.create_text(mid, 158, text=f"{eb}   ▲{fmt_k(s.get('ti'))}   ▼{fmt_k(s.get('to'))}",
-                      fill=DIM, font=("Segoe UI", 11))
+        c.create_text(z0, 158, text=f"{eb}   ▲{fmt_k(s.get('ti'))}   ▼{fmt_k(s.get('to'))}",
+                      fill=DIM, anchor="w", font=("Segoe UI", 11))
 
     def draw_usage(self, pkt):
         c = self.canvas

@@ -150,6 +150,35 @@ def pretty_tool(name):
     return name[:16]
 
 
+def fmt_tokens(v):
+    if v >= 1000000:
+        return f"{v / 1e6:.1f}M"
+    if v >= 1000:
+        return f"{v // 1000}k"
+    return str(v)
+
+
+def tool_detail(inp):
+    """One-line 'what is this tool doing' from its input, octomux-style:
+    first non-empty of a priority list; basenames for path-ish fields."""
+    if not isinstance(inp, dict):
+        return ""
+    qs = inp.get("questions")
+    if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+        q = qs[0].get("question", "")
+        if q:
+            return " ".join(q.split())[:36]
+    for key in ("command", "file_path", "target_file", "notebook_path",
+                "pattern", "url", "query", "description", "path", "prompt"):
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            v = " ".join(v.split())
+            if key.endswith("path") or key == "target_file":
+                v = os.path.basename(v)
+            return v[:36]
+    return ""
+
+
 def fmt_countdown(seconds):
     if seconds is None or seconds < 0:
         return ""
@@ -170,7 +199,12 @@ class Session:
         self.path = path
         self.offset = 0
         self.name = ""
+        self.project = ""             # basename of the session's cwd
+        self.ai_title = ""            # Claude Code's generated session title
+        self.custom_title = ""        # user-set title (wins over ai_title)
         self.model = ""
+        self._sa_count = 0            # active subagent transcripts
+        self._sa_checked = 0
         self.tok_in = 0
         self.tok_out = 0
         self.ctx_tokens = 0
@@ -224,6 +258,22 @@ class Session:
                 self.name = s[:24]
             return
 
+        if rtype == "ai-title":
+            t = rec.get("aiTitle") or rec.get("title") or ""
+            if t:
+                self.ai_title = t.strip()
+            return
+
+        if rtype == "custom-title":
+            t = rec.get("customTitle") or rec.get("title") or ""
+            if t:
+                self.custom_title = t.strip()
+            return
+
+        cwd = rec.get("cwd")
+        if cwd and not self.project:
+            self.project = os.path.basename(cwd.rstrip("/\\")) or cwd
+
         if rec.get("isSidechain"):
             return
 
@@ -272,7 +322,8 @@ class Session:
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "tool_use":
-                    self.pending_ids[b.get("id", "")] = (b.get("name", "Tool"), ts)
+                    self.pending_ids[b.get("id", "")] = (
+                        b.get("name", "Tool"), ts, tool_detail(b.get("input")))
                 elif b.get("type") == "text":
                     text += b.get("text", "")
             if text:
@@ -282,6 +333,7 @@ class Session:
 
     # ---- derived state ----
     def state(self, cfg):
+        """-> (state, tool_name, detail)"""
         now = time.time()
         mtime = safe_mtime(self.path)
         fresh = (now - mtime) < cfg["idle_after_s"]
@@ -290,48 +342,81 @@ class Session:
         if self.pending_ids:
             pending = sorted(self.pending_ids.values(), key=lambda v: v[1])[-1]
 
+        if pending and pending[0] == "AskUserQuestion":
+            # Claude explicitly asked a question - waiting, no threshold
+            return "wait", "Question", pending[2]
+
         if fresh:
             if pending:
-                name, pts = pending
+                name, pts, detail = pending
                 if now - pts > cfg["wait_tool_s"] and now - mtime > cfg["wait_tool_s"]:
-                    return "wait", name          # likely a permission prompt
-                return "tool", name
+                    return "wait", name, detail   # likely a permission prompt
+                return "tool", name, detail
             # no pending tools: if the last thing was an assistant message and
             # nothing new has been written for a while, the turn is over
             if self.last_role == "assistant" and now - mtime > cfg["done_after_s"]:
                 if self.last_assistant_text.rstrip().endswith("?"):
-                    return "wait", ""
-                return "done", ""
-            return "run", ""
+                    return "wait", "", ""
+                return "done", "", ""
+            return "run", "", ""
         # stale
         if pending:
-            return "wait", pending[0]
+            return "wait", pending[0], pending[2]
         if self.last_assistant_text.rstrip().endswith("?"):
-            return "wait", ""
+            return "wait", "", ""
         if self.last_role == "assistant":
-            return "done", ""
-        return "idle", ""
+            return "done", "", ""
+        return "idle", "", ""
+
+    def subagent_count(self):
+        """Active helper-agent transcripts under <slug>/<session-uuid>/subagents."""
+        now = time.time()
+        if now - self._sa_checked < 10:
+            return self._sa_count
+        self._sa_checked = now
+        n = 0
+        base = os.path.join(os.path.dirname(self.path),
+                            os.path.splitext(os.path.basename(self.path))[0],
+                            "subagents")
+        if os.path.isdir(base):
+            for dirpath, _dirs, files in os.walk(base):
+                for fn in files:
+                    if fn.startswith("agent-") and fn.endswith(".jsonl"):
+                        if now - safe_mtime(os.path.join(dirpath, fn)) < 90:
+                            n += 1
+        self._sa_count = n
+        return n
 
     def to_packet(self, cfg):
-        st, tool = self.state(cfg)
+        st, tool, detail = self.state(cfg)
         el = 0
         if self.turn_start:
             end = self.last_event_ts or time.time()
             if st in ("run", "tool"):
                 end = time.time()
             el = max(0, int(end - self.turn_start))
-        ctx = int(round(100.0 * self.ctx_tokens / cfg["context_limit"]))
-        display_name = self.name or os.path.basename(os.path.dirname(self.path))[:24]
+        # context window self-calibration: if we've measured more tokens than
+        # the configured window, this session is on a 1M-context plan
+        limit = cfg["context_limit"]
+        if self.ctx_tokens > limit:
+            limit = 1000000
+        ctx = int(round(100.0 * self.ctx_tokens / limit))
+        title = (self.custom_title or self.ai_title or self.name
+                 or os.path.basename(os.path.dirname(self.path))[:24])
         return {
-            "nm": display_name,
+            "pj": self.project[:20],
+            "nm": title[:38],
             "md": pretty_model(self.model),
             "st": st,
             "tl": pretty_tool(tool),
+            "td": detail[:32],
+            "sa": self.subagent_count(),
             "ef": self.effort,
             "el": el,
             "ti": self.tok_in,
             "to": self.tok_out,
             "cx": min(ctx, 100),
+            "tk": fmt_tokens(self.ctx_tokens),
             "at": st == "wait",
         }
 
@@ -544,12 +629,16 @@ def demo_packets():
         st, tl, cx = next(states)
         yield {
             "t": "s",
-            "ses": [{"nm": "Demo", "md": "Fable 5", "st": st, "tl": tl,
+            "ses": [{"pj": "DemoProject", "nm": "Fix the flux capacitor",
+                     "md": "Fable 5", "st": st, "tl": tl,
+                     "td": "npm test" if tl else "", "sa": 2,
                      "ef": "medium", "el": int(time.time() - t0),
-                     "ti": 56500, "to": 4700, "cx": cx, "at": st == "wait"},
-                    {"nm": "Second", "md": "Opus 4.8", "st": "run", "tl": "",
-                     "ef": "xhigh", "el": 64, "ti": 37700, "to": 3200,
-                     "cx": 55, "at": False}],
+                     "ti": 56500, "to": 4700, "cx": cx, "tk": "12k",
+                     "at": st == "wait"},
+                    {"pj": "SecondProj", "nm": "Refactor auth flow",
+                     "md": "Opus 4.8", "st": "run", "tl": "", "td": "",
+                     "sa": 0, "ef": "xhigh", "el": 64, "ti": 37700,
+                     "to": 3200, "cx": 55, "tk": "110k", "at": False}],
             "act": 0,
             "us": {"p5": 11, "p7": 34, "r5": "36m", "r7": "5d10h", "est": True},
         }

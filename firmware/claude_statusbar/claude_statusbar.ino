@@ -74,11 +74,15 @@
 
 /* ---------- state ---------- */
 struct Sess {
-  char nm[26];  // session name
+  char pj[22];  // project (cwd basename)
+  char nm[40];  // session title (custom > ai-title > summary)
   char md[22];  // model, e.g. "Fable 5"
   char st[10];  // run | tool | wait | idle | done
   char tl[22];  // tool name
+  char td[34];  // tool detail ("npm test", "auth.ts", question text)
   char ef[12];  // effort
+  char tk[10];  // context tokens, human ("612k")
+  int  sa;      // active subagents
   long el;      // elapsed seconds (at packet time)
   long ti, to;  // tokens in / out
   int  cx;      // context %
@@ -291,61 +295,65 @@ static void drawStatusPage() {
   cv->setCursor(10, 158);
   cv->print(pct);
 
-  cv->drawFastVLine(178, 18, 148, C_PANEL);
-
-  /* ----- center: model name above the state word ----- */
-  {
-    char mline[40];
-    if (s.ef[0]) snprintf(mline, sizeof(mline), "%s  ·  %s", s.md, s.ef);
-    else         strlcpy(mline, s.md, sizeof(mline));
-    cv->setFont(&FreeSans9pt7b);
-    drawCentered(mline, 190, CANVAS_W - 10, 36, C_DIM);
+  // raw context tokens under the % (so the % has a visible denominator story)
+  if (s.tk[0]) {
+    cv->setFont(NULL); cv->setTextSize(1);
+    cv->setTextColor(C_DIM);
+    cv->setCursor(10, 168);
+    cv->print(s.tk);
   }
 
-  // rotating whimsical thinking-words, in the spirit of Claude's own
-  static const char *RUN_WORDS[] = {
-    "Clauding...",     "Thinking...",     "Percolating...",
-    "Reflecting...",   "Considering...",  "Analyzing...",
-    "Reasoning...",    "Reviewing...",    "Drafting...",
-    "Refining...",     "Pondering...",    "Ruminating...",
-    "Cogitating...",   "Synthesizing...", "Noodling...",
-    "Brewing...",
-  };
-  static const int N_RUN_WORDS = sizeof(RUN_WORDS) / sizeof(RUN_WORDS[0]);
-  static int runWord = 0;
-  static uint32_t runWordAt = 0;
-  static bool wasRunning = false;
+  cv->drawFastVLine(178, 18, 148, C_PANEL);
 
+  int zone0 = 196, zone1 = CANVAS_W - 10;
+
+  /* ----- row 1: PROJECT (the thing that ties display to session) ----- */
+  {
+    const char *pj = s.pj[0] ? s.pj : (s.nm[0] ? s.nm : "Claude");
+    cv->setFont(&FreeSansBold12pt7b);
+    cv->setTextColor(C_TEXT);
+    cv->setCursor(zone0, 40);
+    cv->print(pj);
+    // model · effort, right-aligned on the same row
+    char mline[36];
+    if (s.ef[0]) snprintf(mline, sizeof(mline), "%s · %s", s.md, s.ef);
+    else         strlcpy(mline, s.md, sizeof(mline));
+    cv->setFont(&FreeSans9pt7b);
+    int16_t mw = textW(mline);
+    cv->setTextColor(C_DIM);
+    cv->setCursor(zone1 - mw, 38);
+    cv->print(mline);
+  }
+
+  /* ----- row 2: session title (ai-title) ----- */
+  if (s.pj[0] && s.nm[0]) {
+    cv->setFont(&FreeSans9pt7b);
+    cv->setTextColor(C_DIM);
+    cv->setCursor(zone0, 64);
+    cv->print(s.nm);
+  }
+
+  /* ----- row 3: state word (real state, no clodisms) ----- */
   const char *word;
   uint16_t wcol = C_TEXT;
   bool animate = false;
-  bool running = !strcmp(s.st, "run");
-  if (running && (!wasRunning || millis() - runWordAt > 7000)) {
-    runWord = esp_random() % N_RUN_WORDS;
-    runWordAt = millis();
-  }
-  wasRunning = running;
-
   if      (!strcmp(s.st, "tool")) { word = s.tl[0] ? s.tl : "Tool"; animate = true; }
-  else if (running)               { word = RUN_WORDS[runWord]; animate = true; }
+  else if (!strcmp(s.st, "run"))  { word = "Running"; animate = true; }
   else if (!strcmp(s.st, "wait")) { word = "Waiting on you"; wcol = C_ORANGE; }
   else if (!strcmp(s.st, "done")) { word = "Done"; wcol = C_GREEN; }
   else                            { word = "Idle"; wcol = C_DIM; }
 
   cv->setFont(&FreeSansBold24pt7b);
   int16_t w = textW(word);
-  int zone0 = 190, zone1 = CANVAS_W - 10;
   if (w > (zone1 - zone0) - 70) {          // too wide: drop to a smaller font
     cv->setFont(&FreeSansBold18pt7b);
     w = textW(word);
   }
-  int tx = zone0 + ((zone1 - zone0) - w) / 2 + 14;
-  if (tx < zone0 + 30) tx = zone0 + 30;
-  int baseY = 100;
+  int tx = zone0 + 34;
+  int baseY = 110;
   if (animate) {
     drawSpinner(tx - 26, baseY - 13, C_ORANGE);
   } else if (!strcmp(s.st, "wait")) {
-    // hollow circle marker
     cv->drawCircle(tx - 26, baseY - 13, 9, C_ORANGE);
     cv->drawCircle(tx - 26, baseY - 13, 8, C_ORANGE);
   }
@@ -353,7 +361,29 @@ static void drawStatusPage() {
   cv->setCursor(tx, baseY);
   cv->print(word);
 
-  /* ----- bottom metrics line ----- */
+  /* ----- row 4: detail - what it's doing / waiting for, + subagents ----- */
+  {
+    char dline[64] = "";
+    if (!strcmp(s.st, "wait") && s.tl[0] && strcmp(s.tl, "Question"))
+      snprintf(dline, sizeof(dline), "approve: %s%s%s", s.tl,
+               s.td[0] ? " · " : "", s.td);
+    else if (s.td[0])
+      strlcpy(dline, s.td, sizeof(dline));
+    if (s.sa > 0) {
+      char sab[20];
+      snprintf(sab, sizeof(sab), "%s%d subagent%s", dline[0] ? " · " : "",
+               s.sa, s.sa > 1 ? "s" : "");
+      strlcat(dline, sab, sizeof(dline));
+    }
+    if (dline[0]) {
+      cv->setFont(&FreeSans9pt7b);
+      cv->setTextColor(C_DIM);
+      cv->setCursor(zone0 + 8, 137);
+      cv->print(dline);
+    }
+  }
+
+  /* ----- row 5: elapsed + tokens ----- */
   long elShown = s.el;
   if (animate) elShown += (long)((millis() - lastPacket) / 1000);
   char eb[12], tib[12], tob[12];
@@ -363,26 +393,14 @@ static void drawStatusPage() {
 
   cv->setFont(&FreeSans9pt7b);
   cv->setTextColor(C_DIM);
-  // measure segments to center the whole group
-  char seg1[16], seg2[16], seg3[16];
-  snprintf(seg1, sizeof(seg1), "%s", eb);
-  snprintf(seg2, sizeof(seg2), "%s", tib);
-  snprintf(seg3, sizeof(seg3), "%s", tob);
-  int wSeg1 = textW(seg1), wSeg2 = textW(seg2), wSeg3 = textW(seg3);
   int gap = 22, icon = 12;
-  int total = wSeg1 + gap + icon + wSeg2 + gap + icon + wSeg3;
-  int x = zone0 + ((zone1 - zone0) - total) / 2;
+  int x = zone0;
   int yBase = 166;
-
-  cv->setCursor(x, yBase); cv->print(seg1); x += wSeg1 + gap;
+  cv->setCursor(x, yBase); cv->print(eb); x += textW(eb) + gap;
   drawUpTri(x, yBase - 9, C_GREEN); x += icon;
-  cv->setCursor(x, yBase); cv->print(seg2); x += wSeg2 + gap;
+  cv->setCursor(x, yBase); cv->print(tib); x += textW(tib) + gap;
   drawDownTri(x, yBase - 9, C_ORANGE); x += icon;
-  cv->setCursor(x, yBase); cv->print(seg3);
-
-  /* session name under header, left of dots */
-  cv->setFont(NULL); cv->setTextSize(1);
-  cv->setTextColor(C_PANEL);
+  cv->setCursor(x, yBase); cv->print(tob);
 
   drawHeader();
 }
@@ -463,18 +481,23 @@ static void gestureFrom(const TouchSample &s) {
     tXl = s.x; tYl = s.y;
   } else if (!s.down && touching) {          // finger up
     touching = false;
+    // the lift report itself carries coordinates - use them: redraws block
+    // the poll loop long enough that drag samples are often missed entirely
+    if (s.x || s.y) { tXl = s.x; tYl = s.y; }
     int dy = tYl - tY0;                      // landscape-horizontal travel
     uint32_t dt = now - tDownAt;
-    if (abs(dy) > 100 && dt < 700) {
+    if (abs(dy) >= 80 && dt < 900) {
       int dir = (dy < 0) ? +1 : -1;          // swipe toward connector = next
       if (flipped) dir = -dir;
-      Serial.printf("[touch] swipe %+d -> session\n", dir);
+      Serial.printf("[touch] swipe %+d (dy=%d dt=%lu) -> session\n",
+                    dir, dy, (unsigned long)dt);
       applyCycle(dir);
-    } else if (dt < 400) {
-      Serial.println("[touch] tap -> page");
+    } else if (dt < 350 && abs(dy) < 40) {
+      Serial.printf("[touch] tap (dy=%d dt=%lu) -> page\n",
+                    dy, (unsigned long)dt);
       applyTap();
     }
-    // touch-hold (>=400ms, no swipe) is deliberately unbound - reserved
+    // touch-hold (no swipe) is deliberately unbound - reserved
   }
 }
 
@@ -524,7 +547,7 @@ static void pollButton() {
 /* =========================== serial =========================== */
 
 static void handleLine(const char *line) {
-  static StaticJsonDocument<10240> doc;  // static: keep off the loop task stack
+  static StaticJsonDocument<14336> doc;  // static: keep off the loop task stack
   DeserializationError err = deserializeJson(doc, line);
   if (err) {
     Serial.printf("[rx] parse error: %s (len %u)\n", err.c_str(), (unsigned)strlen(line));
@@ -538,11 +561,15 @@ static void handleLine(const char *line) {
     for (JsonObject o : arr) {
       if (n >= MAX_SES) break;
       Sess &s = ses[n];
+      strlcpy(s.pj, o["pj"] | "",      sizeof(s.pj));
       strlcpy(s.nm, o["nm"] | "",      sizeof(s.nm));
       strlcpy(s.md, o["md"] | "Claude", sizeof(s.md));
       strlcpy(s.st, o["st"] | "idle",  sizeof(s.st));
       strlcpy(s.tl, o["tl"] | "",      sizeof(s.tl));
+      strlcpy(s.td, o["td"] | "",      sizeof(s.td));
       strlcpy(s.ef, o["ef"] | "",      sizeof(s.ef));
+      strlcpy(s.tk, o["tk"] | "",      sizeof(s.tk));
+      s.sa = o["sa"] | 0;
       s.el = o["el"] | 0L;
       s.ti = o["ti"] | 0L;
       s.to = o["to"] | 0L;
