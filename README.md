@@ -12,7 +12,7 @@
 ![context](https://img.shields.io/badge/context-100%25_(send_help)-critical)
 ![duck lamp](https://img.shields.io/badge/duck_lamp-not_included-lightgrey)
 
-A tiny desk display that shows what Claude is doing, live: current model, the tool it's running ("Bash", "Read", "Percolating…"), elapsed time, tokens in/out, context usage, and your 5-hour / 7-day rate-limit bars. Works with **Claude Desktop (Cowork)** and **Claude Code**, up to 4 sessions at once.
+A tiny desk display that shows what Claude is doing, live: current model, the tool it's running ("Bash", "Read", "Percolating…"), elapsed time, tokens in/out, context usage, and your 5-hour / 7-day rate-limit bars. Works with **Claude Desktop (Cowork)** and **Claude Code**, up to 8 sessions at once.
 
 ![Live session status](docs/images/LilyGo1.png)
 
@@ -85,10 +85,11 @@ The image in the top-left corner of the screen is yours to change: open the app 
 | Action | Result |
 |---|---|
 | Tap screen | Switch page (status ↔ usage) |
-| BOOT button, short press | Cycle session (A/B/C/D) |
+| Swipe left / right | Cycle session (A through H) |
+| BOOT button, short press | Cycle session |
 | BOOT button, hold 1s | Flip display 180° (saved) |
 
-After a tap the screen needs a couple of seconds before the next tap registers — see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for why (touch hardware quirk).
+Full touch gestures work on both hardware revisions of the board — the firmware auto-detects the old (AXS15231B integrated touch) and new (Hynitron CST3530) touch controllers at boot. If neither responds, it falls back to tap-only mode (see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)).
 
 ## Usage limits page
 

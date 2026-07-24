@@ -135,6 +135,18 @@ PYEOF
     find "$DRV_DIR" -maxdepth 1 -name '*.h' ! -name 'AXS15231B.h' -exec cp {} "$SKETCH/" \;
 fi
 
+# ---------- 3a. CST3530 touch firmware blob (new hw revision) ----------
+# Newer boards (~May 2026 on) have a Hynitron CST3530 touch chip that needs
+# its firmware verified/uploaded by the host. The blob comes from LilyGo's
+# cst3530 branch. Optional: without it, old-revision boards and CST boards
+# with healthy firmware still work.
+if [[ ! -f "$SKETCH/cst3530_fw.h" ]]; then
+    step "Downloading CST3530 touch firmware blob..."
+    curl -fsSL "https://raw.githubusercontent.com/Xinyuan-LilyGO/T-Display-S3-Long/T-Display-S3-Long-cst3530/lib/hyn_driver_for_esp32/hyn_chips/cst3530_fw.h" \
+        -o "$SKETCH/cst3530_fw.h" \
+        || echo "  (download failed - continuing without touch-fw upload support)"
+fi
+
 # ---------- 3b. LVGL (the LilyGo driver #includes it) ----------
 if [[ ! -d "$BUILD/user/libraries/lvgl" ]]; then
     step "Installing LVGL 8.3.11 (required by LilyGo's display driver)..."

@@ -3,6 +3,7 @@ firmware/build/
 firmware/claude_statusbar/AXS15231B.cpp
 firmware/claude_statusbar/AXS15231B.h
 firmware/claude_statusbar/pins_config.h
+firmware/claude_statusbar/cst3530_fw.h
 *.bin
 *.elf
 *.map

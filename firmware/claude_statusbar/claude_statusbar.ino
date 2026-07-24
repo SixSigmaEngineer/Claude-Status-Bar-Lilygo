@@ -5,12 +5,13 @@
  * context %) plus a usage-limits page. Fed by claude_bar_bridge.py on the PC
  * over USB serial @ 115200 as newline-delimited JSON.
  *
- * Controls:
+ * Controls (with a working touch chip - see touch_drv.h):
  *   - Tap screen            : switch page (status <-> usage)
- *   - Double-tap screen     : cycle active session
- *   - Long-press (>1s)      : flip display 180° (saved to flash)
- *   - BOOT button short     : switch page
- *   - BOOT button long      : cycle session
+ *   - Swipe left/right      : cycle active session
+ *   - Touch-hold            : unbound (reserved for future use)
+ *   - BOOT button short     : cycle active session
+ *   - BOOT button long (1s) : flip display 180° (saved to flash)
+ * Without one (blind-tap fallback): tap = switch page, BOOT as above.
  *
  * Build notes: requires AXS15231B.cpp/.h + pins_config.h from the official
  * LilyGo T-Display-S3-Long repo copied into this sketch folder (the
@@ -29,6 +30,7 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include "AXS15231B.h"
 #include "pins_config.h"
+#include "touch_drv.h"
 
 /* ---------- fallbacks in case pins_config.h names differ ---------- */
 #ifndef TOUCH_IICSCL
@@ -83,7 +85,8 @@ struct Sess {
   bool at;      // needs attention
 };
 
-Sess ses[4];
+#define MAX_SES 8
+Sess ses[MAX_SES];
 int  nSes = 0, act = 0;
 
 struct { int p5 = -1, p7 = -1; char r5[14] = ""; char r7[14] = ""; bool est = true; } usage;
@@ -110,9 +113,10 @@ uint8_t  spinPhase = 0;
 volatile bool touchIRQ = false;
 volatile uint32_t irqCount = 0;
 void IRAM_ATTR touchISR() { touchIRQ = true; irqCount++; }
-uint32_t tDownAt = 0, tUpAt = 0;
-bool     touching = false, longFired = false;
-int      pendingTaps = 0;
+TouchBackend touchBE = TOUCH_NONE;
+bool     touching = false;
+int16_t  tX0 = 0, tY0 = 0, tXl = 0, tYl = 0;
+uint32_t tDownAt = 0;
 uint32_t btnDownAt = 0;
 bool     btnWas = false;
 
@@ -442,19 +446,51 @@ static void redraw() {
 /* =========================== input =========================== */
 
 static void applyTap()        { page = (page + 1) % 2; dirty = true; }
-static void applyDoubleTap()  { if (nSes > 1) act = (act + 1) % nSes; dirty = true; }
+static void applyCycle(int d) { if (nSes > 1) act = (act + nSes + d) % nSes; dirty = true; }
+static void applyDoubleTap()  { applyCycle(+1); }
 static void applyLongPress()  { flipped = !flipped; prefs.putBool("flip", flipped); dirty = true; }
 
+/* Gesture engine over real coordinates (CST3530 / AXS backends).
+ * The controller reports in portrait axes: x = short side (0..179),
+ * y = long side (0..639). In landscape, a horizontal swipe is a y-run. */
+static void gestureFrom(const TouchSample &s) {
+  uint32_t now = millis();
+  if (s.down && !touching) {                 // finger down
+    touching = true;
+    tX0 = tXl = s.x; tY0 = tYl = s.y;
+    tDownAt = now;
+  } else if (s.down && touching) {           // drag
+    tXl = s.x; tYl = s.y;
+  } else if (!s.down && touching) {          // finger up
+    touching = false;
+    int dy = tYl - tY0;                      // landscape-horizontal travel
+    uint32_t dt = now - tDownAt;
+    if (abs(dy) > 100 && dt < 700) {
+      int dir = (dy < 0) ? +1 : -1;          // swipe toward connector = next
+      if (flipped) dir = -dir;
+      Serial.printf("[touch] swipe %+d -> session\n", dir);
+      applyCycle(dir);
+    } else if (dt < 400) {
+      Serial.println("[touch] tap -> page");
+      applyTap();
+    }
+    // touch-hold (>=400ms, no swipe) is deliberately unbound - reserved
+  }
+}
+
 static void pollTouch() {
-  // This unit's touch I2C is unreachable, and after any touch the chip
-  // pulses INT indefinitely (unread-data begging), so touch duration can't
-  // be measured. Instead: one clean gesture. A touch after a quiet period
-  // fires immediately (switch page), then touch re-arms once the INT line
-  // has been quiet for a while.
   static uint32_t lastPoll = 0;
-  if (millis() - lastPoll < 30) return;
+  if (millis() - lastPoll < 20) return;
   lastPoll = millis();
 
+  if (touchBE != TOUCH_NONE) {
+    TouchSample s = touchRead(touchBE);
+    if (s.valid) gestureFrom(s);
+    return;
+  }
+
+  // Fallback (no touch chip detected): blind INT-pulse tap. After any touch
+  // the chip pulses INT for a while, so wait for quiet before re-arming.
   static uint32_t lastIrqSeen = 0, lastActivity = 0;
   static bool armed = true;
   uint32_t now = millis();
@@ -488,7 +524,7 @@ static void pollButton() {
 /* =========================== serial =========================== */
 
 static void handleLine(const char *line) {
-  static StaticJsonDocument<6144> doc;  // static: keep off the loop task stack
+  static StaticJsonDocument<10240> doc;  // static: keep off the loop task stack
   DeserializationError err = deserializeJson(doc, line);
   if (err) {
     Serial.printf("[rx] parse error: %s (len %u)\n", err.c_str(), (unsigned)strlen(line));
@@ -500,7 +536,7 @@ static void handleLine(const char *line) {
     JsonArray arr = doc["ses"].as<JsonArray>();
     int n = 0;
     for (JsonObject o : arr) {
-      if (n >= 4) break;
+      if (n >= MAX_SES) break;
       Sess &s = ses[n];
       strlcpy(s.nm, o["nm"] | "",      sizeof(s.nm));
       strlcpy(s.md, o["md"] | "Claude", sizeof(s.md));
@@ -594,7 +630,9 @@ void setup() {
   digitalWrite(TOUCH_RES, HIGH); delay(2);
   digitalWrite(TOUCH_RES, LOW);  delay(100);
   digitalWrite(TOUCH_RES, HIGH); delay(2);
+  Wire.setBufferSize(1100);   // CST3530 fw upload sends 1026-byte writes
   Wire.begin(TOUCH_IICSDA, TOUCH_IICSCL);
+  Wire.setClock(200000);      // hyn driver runs the bus at 200 kHz
 
   // SY6970 battery-charger config (required for stable power w/o battery):
   // disable ILIM pin + max input current limit; turn off BATFET
@@ -629,6 +667,23 @@ void setup() {
   pushCanvas();
   Serial.println("[boot] splash pushed OK");
   delay(600);
+
+  // touch: detect which revision's controller we have and bring it up.
+  // Done after display init: the AXS integrated touch (old revision) only
+  // answers once the panel is initialized, and the CST path pulses its own
+  // reset (GPIO2), which is safe on old boards where that pin is unused.
+  touchBE = touchDetect();
+  if (touchBE == TOUCH_CST) {
+    Serial.println("[touch] CST3530 detected (new hw revision)");
+    if (!cstInit()) {
+      Serial.println("[touch] CST init failed - falling back to blind-tap");
+      touchBE = TOUCH_NONE;
+    }
+  } else if (touchBE == TOUCH_AXS) {
+    Serial.println("[touch] AXS15231B integrated touch detected (old hw revision)");
+  } else {
+    Serial.println("[touch] no touch controller answered - blind-tap fallback");
+  }
 
   // load saved logo, if one was uploaded
   logoBuf = (uint16_t *)malloc(LOGO_BYTES);

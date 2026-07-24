@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
     "roots": default_roots(),
     "port": "",                  # "" = auto-detect (ESP32-S3 native USB)
     "baud": 115200,
-    "max_sessions": 4,
+    "max_sessions": 8,
     "active_window_min": 30,     # sessions modified within N minutes are shown
     "idle_after_s": 120,         # no file writes for this long -> idle/done
     "wait_tool_s": 20,           # pending tool call older than this -> "waiting on you"
